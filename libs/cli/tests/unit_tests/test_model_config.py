@@ -16,6 +16,7 @@ from deepagents_cli.model_config import (
     ModelConfigError,
     ModelProfileEntry,
     ModelSpec,
+    ProviderAuthSource,
     ProviderAuthState,
     ProviderAuthStatus,
     _get_builtin_providers,
@@ -141,6 +142,148 @@ class TestHasProviderCredentials:
             clear=True,
         ):
             assert has_provider_credentials("anthropic") is True
+
+
+@pytest.fixture
+def fake_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the credential store into a temp directory."""
+    state_dir = tmp_path / ".state"
+    monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_STATE_DIR", state_dir)
+    return state_dir
+
+
+class TestStoredCredentials:
+    """Stored API keys (added via /auth) integrate into auth resolution."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_dotenv_prefixed_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Strip `DEEPAGENTS_CLI_*` keys preloaded from `~/.deepagents/.env`.
+
+        `dotenv.load_dotenv()` runs at config-import time and may inject
+        prefixed variants that win over `monkeypatch.setenv` in
+        `resolve_env_var`'s lookup order.
+        """
+        for var in (
+            "DEEPAGENTS_CLI_ANTHROPIC_API_KEY",
+            "DEEPAGENTS_CLI_OPENAI_API_KEY",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_resolve_provider_credential_prefers_stored_over_env(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stored credential beats env var (matches pi-mono ordering)."""
+        from deepagents_cli import auth_store
+        from deepagents_cli.model_config import resolve_provider_credential
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        auth_store.set_stored_key("anthropic", "from-store")
+
+        assert resolve_provider_credential("anthropic") == "from-store"
+
+    def test_resolve_provider_credential_falls_back_to_env(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Env var is used when no stored credential exists."""
+        from deepagents_cli.model_config import resolve_provider_credential
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        assert resolve_provider_credential("anthropic") == "from-env"
+
+    def test_resolve_provider_credential_returns_none_for_unknown_provider(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Provider with no env-var binding and no stored key returns None."""
+        from deepagents_cli.model_config import resolve_provider_credential
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert resolve_provider_credential("totally-unknown") is None
+
+    def test_status_reports_stored_credential(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stored key flips status to CONFIGURED with a stored detail."""
+        from deepagents_cli import auth_store
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        auth_store.set_stored_key("anthropic", "from-store")
+
+        status = get_provider_auth_status("anthropic")
+        assert status.state is ProviderAuthState.CONFIGURED
+        assert status.source is ProviderAuthSource.STORED
+        assert status.env_var == "ANTHROPIC_API_KEY"
+
+    def test_apply_stored_credentials_sets_env_var(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`apply_stored_credentials` exports the stored key into os.environ."""
+        from deepagents_cli import auth_store
+        from deepagents_cli.model_config import apply_stored_credentials
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        auth_store.set_stored_key("openai", "from-store")
+        applied = apply_stored_credentials("openai")
+
+        assert applied is True
+        import os
+
+        assert os.environ["OPENAI_API_KEY"] == "from-store"
+
+    def test_apply_stored_credentials_overrides_existing_env(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stored credential takes precedence over an already-set env var."""
+        from deepagents_cli import auth_store
+        from deepagents_cli.model_config import apply_stored_credentials
+
+        monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+        auth_store.set_stored_key("openai", "from-store")
+
+        assert apply_stored_credentials("openai") is True
+        import os
+
+        assert os.environ["OPENAI_API_KEY"] == "from-store"
+
+    def test_apply_stored_credentials_noop_when_no_store(
+        self,
+        fake_state_dir: Path,  # noqa: ARG002
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No stored key means no environment mutation."""
+        from deepagents_cli.model_config import apply_stored_credentials
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        assert apply_stored_credentials("anthropic") is False
+        import os
+
+        assert os.environ["ANTHROPIC_API_KEY"] == "from-env"
+
+    def test_corrupt_store_does_not_block_status(
+        self,
+        fake_state_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A corrupt auth.json doesn't poison `get_provider_auth_status`."""
+        path = fake_state_dir / "auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{not json")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        # Status should still resolve via env var without raising.
+        status = get_provider_auth_status("anthropic")
+        assert status.state is ProviderAuthState.CONFIGURED
+        assert status.source is ProviderAuthSource.ENV
 
 
 class TestThreadColumnPersistence:
@@ -483,6 +626,40 @@ class TestResolveEnvVar:
         from deepagents_cli.model_config import resolve_env_var
 
         assert resolve_env_var("DEEPAGENTS_CLI_MY_KEY") == "direct"
+
+
+class TestUnknownProviderError:
+    """Tests for the structured `UnknownProviderError` exception."""
+
+    def test_message_mentions_spec_and_docs_url(self):
+        """Message references both `model_spec` and the docs URL."""
+        from deepagents_cli.model_config import (
+            PROVIDERS_DOCS_URL,
+            UnknownProviderError,
+        )
+
+        exc = UnknownProviderError(model_spec="mystery-model")
+        assert exc.model_spec == "mystery-model"
+        assert exc.docs_url == PROVIDERS_DOCS_URL
+        assert "mystery-model" in str(exc)
+        assert PROVIDERS_DOCS_URL in str(exc)
+
+    def test_empty_model_spec_rejected(self):
+        """Empty `model_spec` raises `ValueError` at construction time."""
+        from deepagents_cli.model_config import UnknownProviderError
+
+        with pytest.raises(ValueError, match="non-empty"):
+            UnknownProviderError(model_spec="")
+
+    def test_docs_url_is_class_attribute(self):
+        """`docs_url` lives on the class, not the instance — same for every error."""
+        from deepagents_cli.model_config import (
+            PROVIDERS_DOCS_URL,
+            UnknownProviderError,
+        )
+
+        # Class-level access works without an instance.
+        assert UnknownProviderError.docs_url == PROVIDERS_DOCS_URL
 
 
 class TestProviderApiKeyEnv:

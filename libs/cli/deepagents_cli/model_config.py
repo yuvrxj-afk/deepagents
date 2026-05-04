@@ -17,10 +17,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypedDict
 from urllib.parse import urlparse
 
 import tomli_w
+
+from deepagents_cli import auth_store
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -28,6 +30,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ENV_PREFIX = "DEEPAGENTS_CLI_"
+
+
+def resolved_env_var_name(canonical: str) -> str:
+    """Return whichever env var name actually carries the resolved value.
+
+    Mirrors `resolve_env_var`'s precedence: when the prefixed variant is
+    present in `os.environ` (even empty), it wins; otherwise the canonical
+    name is returned. Useful for UI labels that need to reflect what the
+    CLI is actually reading rather than the canonical name.
+
+    Args:
+        canonical: The canonical environment variable name.
+
+    Returns:
+        The resolving env var name (prefixed or canonical).
+    """
+    if not canonical.startswith(_ENV_PREFIX):
+        prefixed = f"{_ENV_PREFIX}{canonical}"
+        if prefixed in os.environ:
+            return prefixed
+    return canonical
 
 
 def resolve_env_var(name: str) -> str | None:
@@ -70,8 +93,54 @@ def resolve_env_var(name: str) -> str | None:
     return os.environ.get(name) or None
 
 
+PROVIDERS_DOCS_URL = (
+    "https://docs.langchain.com/oss/python/deepagents/cli/providers#provider-reference"
+)
+"""Public CLI docs page for configuring model providers.
+
+Referenced by `UnknownProviderError` and the `/auth` manager so the same
+URL is used everywhere a user is sent to read about provider setup.
+"""
+
+
 class ModelConfigError(Exception):
     """Raised when model configuration or creation fails."""
+
+
+class UnknownProviderError(ModelConfigError):
+    """Raised when neither the CLI nor `init_chat_model` can infer a provider.
+
+    Carries the offending model spec as an attribute and exposes
+    `PROVIDERS_DOCS_URL` as a class-level constant so callers can render
+    a clickable link without string-scanning the formatted message. This
+    mirrors how `MissingCredentialsError` exposes `provider` / `env_var`
+    for targeted recovery hints.
+    """
+
+    docs_url: ClassVar[str] = PROVIDERS_DOCS_URL
+    """Provider-reference docs URL. Class-level so callers don't pass it."""
+
+    def __init__(self, *, model_spec: str) -> None:
+        """Initialize the error.
+
+        Args:
+            model_spec: The bare model name the user supplied (e.g.
+                `'mystery-model'`). When the input had a `provider:model`
+                form, parsing succeeds and this exception does not fire.
+
+        Raises:
+            ValueError: If `model_spec` is empty.
+        """
+        if not model_spec:
+            msg = "model_spec must be non-empty"
+            raise ValueError(msg)
+        message = (
+            f"Unable to infer a model provider for {model_spec!r}. "
+            f"Specify one explicitly (e.g. 'anthropic:{model_spec}') "
+            f"or see the provider reference at {self.docs_url}."
+        )
+        super().__init__(message)
+        self.model_spec = model_spec
 
 
 class MissingCredentialsError(ModelConfigError):
@@ -124,6 +193,16 @@ class ProviderAuthState(StrEnum):
     """The CLI cannot determine whether provider auth is ready."""
 
 
+class ProviderAuthSource(StrEnum):
+    """Origin of a `CONFIGURED` credential, used to discriminate display."""
+
+    STORED = "stored"
+    """Persisted via `/auth` in `~/.deepagents/.state/auth.json`."""
+
+    ENV = "env"
+    """Resolved from an environment variable."""
+
+
 @dataclass(frozen=True)
 class ProviderAuthStatus:
     """Credential readiness information for a provider.
@@ -132,13 +211,35 @@ class ProviderAuthStatus:
         state: Provider auth state.
         provider: Provider name.
         env_var: Env var name associated with the state, when applicable.
+        source: For `CONFIGURED` states, where the credential value came
+            from. `None` for non-configured states or when the source is
+            not meaningful (e.g., implicit/managed auth).
         detail: Short user-facing context for selectors and logs.
     """
 
     state: ProviderAuthState
     provider: str
     env_var: str | None = None
+    source: ProviderAuthSource | None = None
     detail: str | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce the source-vs-state invariant.
+
+        Raises:
+            ValueError: If `source` is set but `state` is not `CONFIGURED`,
+                or if `state` is `CONFIGURED` but no `source` is recorded.
+        """
+        is_configured = self.state is ProviderAuthState.CONFIGURED
+        has_source = self.source is not None
+        if is_configured != has_source:
+            msg = (
+                f"ProviderAuthStatus invariant violated: "
+                f"state={self.state!r} requires "
+                f"{'a source' if is_configured else 'source=None'}, "
+                f"got source={self.source!r}"
+            )
+            raise ValueError(msg)
 
     @property
     def blocks_start(self) -> bool:
@@ -877,6 +978,93 @@ def _get_provider_endpoint(provider: str, config: ModelConfig) -> str | None:
     return resolve_env_var(host_env)
 
 
+def _has_stored_credential(provider: str) -> bool:
+    """Return whether `provider` has a credential persisted via `/auth`.
+
+    A corrupt `auth.json` is swallowed (logged, treated as absent) so the
+    model selector and other read-side callers can keep listing providers.
+    The user-visible signal lives in `AuthManagerScreen` — opening `/auth`
+    surfaces a corruption banner directly. Read-side resilience here means
+    you can still pick a different provider while the file is broken.
+    """
+    try:
+        return auth_store.get_stored_key(provider) is not None
+    except RuntimeError:
+        logger.warning(
+            "Could not read stored credentials for provider %s; treating as absent",
+            provider,
+        )
+        return False
+
+
+def resolve_provider_credential(provider: str) -> str | None:
+    """Resolve the credential value for `provider` from any configured source.
+
+    Lookup order:
+
+    1. Stored API key in `~/.deepagents/.state/auth.json` (added via `/auth`).
+    2. Canonical env var via `resolve_env_var()` (which honors the
+        `DEEPAGENTS_CLI_` prefix and dotenv files).
+
+    A user who has *both* a stored key and an env var set gets the stored
+    key — entering one in the TUI is the more deliberate, more recent
+    action, so "I just typed this in" beats whatever the shell exported.
+
+    Args:
+        provider: Provider name (e.g., `"anthropic"`).
+
+    Returns:
+        The credential value, or `None` when no source has one or the
+        provider has no env-var mapping at all.
+    """
+    try:
+        stored = auth_store.get_stored_key(provider)
+    except RuntimeError:
+        logger.warning(
+            "Could not read stored credentials for provider %s; falling back to env",
+            provider,
+        )
+        stored = None
+    if stored:
+        return stored
+    env_var = get_credential_env_var(provider)
+    if env_var:
+        return resolve_env_var(env_var)
+    return None
+
+
+def _resolve_configured(provider: str, env_var: str) -> ProviderAuthStatus | None:
+    """Return a `CONFIGURED` status if a stored or env credential is set.
+
+    Stored credentials beat env vars (matches `resolve_provider_credential`).
+
+    Args:
+        provider: Provider name (e.g., `"anthropic"`).
+        env_var: Canonical env var name to check when no stored credential
+            exists. Recorded on the returned status either way.
+
+    Returns:
+        A `CONFIGURED` status, or `None` when neither source is set.
+    """
+    if _has_stored_credential(provider):
+        return ProviderAuthStatus(
+            state=ProviderAuthState.CONFIGURED,
+            provider=provider,
+            env_var=env_var,
+            source=ProviderAuthSource.STORED,
+            detail="stored credential",
+        )
+    if resolve_env_var(env_var):
+        return ProviderAuthStatus(
+            state=ProviderAuthState.CONFIGURED,
+            provider=provider,
+            env_var=env_var,
+            source=ProviderAuthSource.ENV,
+            detail="credentials set",
+        )
+    return None
+
+
 def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
     """Return credential readiness details for a provider.
 
@@ -921,13 +1109,9 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
     if provider_config:
         env_var = provider_config.get("api_key_env")
         if env_var:
-            if resolve_env_var(env_var):
-                return ProviderAuthStatus(
-                    state=ProviderAuthState.CONFIGURED,
-                    provider=provider,
-                    env_var=env_var,
-                    detail="credentials set",
-                )
+            configured = _resolve_configured(provider, env_var)
+            if configured:
+                return configured
             return ProviderAuthStatus(
                 state=ProviderAuthState.MISSING,
                 provider=provider,
@@ -948,13 +1132,9 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
     # Fall back to hardcoded well-known providers.
     env_var = PROVIDER_API_KEY_ENV.get(provider)
     if env_var:
-        if resolve_env_var(env_var):
-            return ProviderAuthStatus(
-                state=ProviderAuthState.CONFIGURED,
-                provider=provider,
-                env_var=env_var,
-                detail="credentials set",
-            )
+        configured = _resolve_configured(provider, env_var)
+        if configured:
+            return configured
         if provider in IMPLICIT_AUTH_PROVIDERS:
             return ProviderAuthStatus(
                 state=ProviderAuthState.IMPLICIT,
@@ -977,13 +1157,10 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
         )
 
     optional_env = OPTIONAL_AUTH_ENV.get(provider)
-    if optional_env and resolve_env_var(optional_env):
-        return ProviderAuthStatus(
-            state=ProviderAuthState.CONFIGURED,
-            provider=provider,
-            env_var=optional_env,
-            detail="credentials set",
-        )
+    if optional_env:
+        configured = _resolve_configured(provider, optional_env)
+        if configured:
+            return configured
 
     if provider in NO_AUTH_REQUIRED_PROVIDERS:
         endpoint = _get_provider_endpoint(provider, config)
@@ -1058,6 +1235,41 @@ def get_credential_env_var(provider: str) -> str | None:
     if config_env:
         return config_env
     return PROVIDER_API_KEY_ENV.get(provider)
+
+
+def apply_stored_credentials(provider: str) -> bool:
+    """Export this provider's stored API key into `os.environ` for SDK use.
+
+    LangChain's chat-model factories read credentials from process env vars,
+    so a stored key only takes effect once it's copied onto the env var name
+    registered for that provider. This is a no-op when the provider has no
+    env-var mapping (custom auth) or no stored credential.
+
+    The env var is overwritten whether or not it was already set, matching
+    the precedence rule documented on `resolve_provider_credential`: a
+    credential the user typed in `/auth` is the most recent deliberate
+    action and should take effect.
+
+    Args:
+        provider: Provider name.
+
+    Returns:
+        `True` if a stored key was applied, `False` otherwise.
+    """
+    env_var = get_credential_env_var(provider)
+    if not env_var:
+        return False
+    try:
+        stored = auth_store.get_stored_key(provider)
+    except RuntimeError:
+        logger.warning("Could not read stored credentials for provider %s", provider)
+        return False
+    if not stored:
+        return False
+    if os.environ.get(env_var) == stored:
+        return True
+    os.environ[env_var] = stored
+    return True
 
 
 @dataclass(frozen=True)

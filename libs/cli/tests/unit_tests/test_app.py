@@ -1367,6 +1367,66 @@ class TestModalScreenCtrlDHandling:
 
             exit_mock.assert_called_once()
 
+    async def test_ctrl_d_opens_delete_confirm_in_auth_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+D in the auth prompt should open the confirm modal, not quit."""
+        from deepagents_cli import auth_store
+        from deepagents_cli.widgets.auth import (
+            AuthPromptScreen,
+            DeleteCredentialConfirmScreen,
+        )
+
+        monkeypatch.setattr(
+            "deepagents_cli.model_config.DEFAULT_STATE_DIR", tmp_path / ".state"
+        )
+        auth_store.set_stored_key("openai", "k")
+
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(AuthPromptScreen("openai", "OPENAI_API_KEY"))
+            await pilot.pause()
+
+            with patch.object(app, "exit") as exit_mock:
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+
+            assert isinstance(app.screen, DeleteCredentialConfirmScreen)
+            exit_mock.assert_not_called()
+
+    async def test_ctrl_d_in_auth_confirm_arms_quit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+D inside the auth confirm modal arms the double-press quit."""
+        from deepagents_cli import auth_store
+        from deepagents_cli.widgets.auth import AuthPromptScreen
+
+        monkeypatch.setattr(
+            "deepagents_cli.model_config.DEFAULT_STATE_DIR", tmp_path / ".state"
+        )
+        auth_store.set_stored_key("openai", "k")
+
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.push_screen(AuthPromptScreen("openai", "OPENAI_API_KEY"))
+            await pilot.pause()
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+
+            with patch.object(app, "exit") as exit_mock:
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+                exit_mock.assert_not_called()
+                assert app._quit_pending is True
+
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+                exit_mock.assert_called_once()
+
 
 class TestModalScreenShiftTabHandling:
     """Tests for app-level Shift+Tab behavior while modals are open."""
@@ -1406,6 +1466,41 @@ class TestModalScreenShiftTabHandling:
             await pilot.pause()
 
             assert filter_input.has_focus
+            assert app._auto_approve is False
+
+    async def test_shift_tab_navigates_in_auth_manager(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Shift+Tab should move the manager option-list cursor up, not toggle."""
+        from textual.widgets import OptionList
+
+        from deepagents_cli.widgets.auth import AuthManagerScreen
+
+        monkeypatch.setattr(
+            "deepagents_cli.model_config.DEFAULT_STATE_DIR", tmp_path / ".state"
+        )
+
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = AuthManagerScreen()
+            app.push_screen(screen)
+            await pilot.pause()
+
+            options = screen.query_one("#auth-manager-options", OptionList)
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            after_tab = options.highlighted
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+
+            assert options.highlighted is not None
+            assert after_tab is not None
+            assert options.highlighted < after_tab
             assert app._auto_approve is False
 
 
@@ -2279,6 +2374,23 @@ class TestTraceCommand:
 
             app_msgs = app.query(AppMessage)
             assert any("No active session" in str(w._content) for w in app_msgs)
+
+    async def test_auth_routed_from_handle_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """'/auth' should push the AuthManagerScreen modal."""
+        from deepagents_cli.widgets.auth import AuthManagerScreen
+
+        monkeypatch.setattr(
+            "deepagents_cli.model_config.DEFAULT_STATE_DIR", tmp_path / ".state"
+        )
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/auth")
+            await pilot.pause()
+            assert isinstance(app.screen, AuthManagerScreen)
 
 
 class TestRunAgentTaskMediaTracker:
@@ -4283,6 +4395,40 @@ class TestDeferredActions:
 
             await app._drain_deferred_actions()
             assert executed == ["thread", "second_model"]
+
+
+class TestBuildModelSwitchErrorBody:
+    """Tests for `_build_model_switch_error_body` link-aware formatting."""
+
+    def test_unknown_provider_error_returns_content_with_clickable_link(self) -> None:
+        """`UnknownProviderError` produces a `Content` body with a `link` span."""
+        from textual.content import Content
+
+        from deepagents_cli.app import _build_model_switch_error_body
+        from deepagents_cli.model_config import (
+            PROVIDERS_DOCS_URL,
+            UnknownProviderError,
+        )
+
+        exc = UnknownProviderError(model_spec="mystery-model")
+        body = _build_model_switch_error_body(exc)
+        assert isinstance(body, Content)
+        links = [
+            getattr(span.style, "link", None)
+            for span in body.spans
+            if getattr(span.style, "link", None)
+        ]
+        assert links == [PROVIDERS_DOCS_URL]
+        # Both the model spec and the URL appear in the rendered text.
+        assert "mystery-model" in body.plain
+        assert PROVIDERS_DOCS_URL in body.plain
+
+    def test_other_exception_returns_plain_string(self) -> None:
+        """Non-`UnknownProviderError` exceptions render as a plain string body."""
+        from deepagents_cli.app import _build_model_switch_error_body
+
+        body = _build_model_switch_error_body(ValueError("boom"))
+        assert body == "Failed to switch model: boom"
 
 
 class TestServerStartupError:

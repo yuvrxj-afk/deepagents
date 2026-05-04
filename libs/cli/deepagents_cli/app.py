@@ -474,6 +474,30 @@ def _log_task_exception(task: asyncio.Task[Any]) -> None:
         logger.warning("Background task failed unexpectedly", exc_info=True)
 
 
+def _build_model_switch_error_body(exc: BaseException) -> str | Content:
+    """Format a model-switch failure for `ErrorMessage`.
+
+    Args:
+        exc: Exception raised by `create_model`.
+
+    Returns:
+        A `Content` with the docs URL as a clickable span when `exc` is
+        `UnknownProviderError`; a plain string otherwise.
+    """
+    from deepagents_cli.model_config import UnknownProviderError
+
+    if isinstance(exc, UnknownProviderError):
+        return Content.assemble(
+            "Failed to switch model: unable to infer a provider for ",
+            (exc.model_spec, TStyle(bold=True)),
+            ".\n\nSpecify one explicitly (e.g. ",
+            (f"anthropic:{exc.model_spec}", TStyle(italic=True)),
+            ") or see the provider reference: ",
+            (exc.docs_url, TStyle(underline=True, link=exc.docs_url)),
+        )
+    return f"Failed to switch model: {exc}"
+
+
 def _format_startup_error(error: BaseException) -> str:
     """Format a server-startup exception for the welcome banner.
 
@@ -1991,8 +2015,9 @@ class DeepAgentsApp(App):
             and self._server_kwargs is not None
         ):
             text += (
-                "\n\nHint: run `/model <provider>:<model>` to retry "
-                "startup with a provider you have credentials for."
+                "\n\nHint: run `/auth` to add a key for this provider, then "
+                "`/model <provider>:<model>` to retry startup. Or pick a "
+                "different provider directly with `/model`."
             )
 
         async def _mount_failure() -> None:
@@ -4003,10 +4028,10 @@ class DeepAgentsApp(App):
         elif cmd == "/help":
             await self._mount_message(UserMessage(command))
             help_body = (
-                "Commands: /quit, /agents, /clear, /offload, /editor, /mcp, "
-                "/model [--model-params JSON] [--default], /notifications, "
-                "/reload, /skill:<name>, /remember, /skill-creator, /theme, "
-                "/tokens, /threads, /trace, "
+                "Commands: /quit, /agents, /auth, /clear, /offload, /editor, "
+                "/mcp, /model [--model-params JSON] [--default], "
+                "/notifications, /reload, /skill:<name>, /remember, "
+                "/skill-creator, /theme, /tokens, /threads, /trace, "
                 "/update, /auto-update, /changelog, /docs, /feedback, /help\n\n"
                 "Interactive Features:\n"
                 "  Enter           Submit your message\n"
@@ -4135,6 +4160,8 @@ class DeepAgentsApp(App):
             await self._handle_skill_command(rewritten)
         elif cmd == "/mcp":
             await self._show_mcp_viewer()
+        elif cmd == "/auth":
+            await self._show_auth_manager()
         elif cmd == "/theme":
             await self._show_theme_selector()
         elif cmd == "/notifications":
@@ -5563,6 +5590,10 @@ class DeepAgentsApp(App):
 
     def action_quit_app(self) -> None:
         """Handle quit action (Ctrl+D)."""
+        from deepagents_cli.widgets.auth import (
+            AuthPromptScreen,
+            DeleteCredentialConfirmScreen,
+        )
         from deepagents_cli.widgets.thread_selector import (
             DeleteThreadConfirmScreen,
             ThreadSelectorScreen,
@@ -5571,7 +5602,13 @@ class DeepAgentsApp(App):
         if isinstance(self.screen, ThreadSelectorScreen):
             self.screen.action_delete_thread()
             return
-        if isinstance(self.screen, DeleteThreadConfirmScreen):
+        if isinstance(self.screen, AuthPromptScreen):
+            self.screen.action_delete_stored()
+            return
+        if isinstance(
+            self.screen,
+            (DeleteThreadConfirmScreen, DeleteCredentialConfirmScreen),
+        ):
             if self._quit_pending:
                 self.exit()
                 return
@@ -5647,6 +5684,7 @@ class DeepAgentsApp(App):
         bar indicator and session state.
         """
         from deepagents_cli.widgets.agent_selector import AgentSelectorScreen
+        from deepagents_cli.widgets.auth import AuthManagerScreen
         from deepagents_cli.widgets.mcp_viewer import MCPViewerScreen
         from deepagents_cli.widgets.notification_center import (
             NotificationCenterScreen,
@@ -5662,7 +5700,10 @@ class DeepAgentsApp(App):
         if isinstance(self.screen, ThreadSelectorScreen):
             self.screen.action_focus_previous_filter()
             return
-        if isinstance(self.screen, (ThemeSelectorScreen, AgentSelectorScreen)):
+        if isinstance(
+            self.screen,
+            (ThemeSelectorScreen, AgentSelectorScreen, AuthManagerScreen),
+        ):
             self.screen.action_cursor_up()
             return
         if isinstance(self.screen, NotificationSettingsScreen):
@@ -6066,6 +6107,21 @@ class DeepAgentsApp(App):
             default_agent=default_agent,
         )
         self.push_screen(screen, handle_result)
+
+    async def _show_auth_manager(self) -> None:
+        """Show the `/auth` credential manager modal.
+
+        State changes persist via `auth_store`; the manager refreshes its
+        own option labels after each save/delete, so this caller only needs
+        to refocus the chat input on close.
+        """
+        from deepagents_cli.widgets.auth import AuthManagerScreen
+
+        def handle_result(_result: None) -> None:
+            if self._chat_input:
+                self._chat_input.focus_input()
+
+        self.push_screen(AuthManagerScreen(), handle_result)
 
     def _switch_agent(self, agent_name: str) -> None:
         """Switch to a different agent and hot-restart the backing server.
@@ -7115,8 +7171,8 @@ class DeepAgentsApp(App):
         from deepagents_cli.config import create_model, detect_provider, settings
         from deepagents_cli.model_config import (
             ModelSpec,
-            get_credential_env_var,
-            has_provider_credentials,
+            ProviderAuthState,
+            get_provider_auth_status,
             save_recent_model,
         )
 
@@ -7178,23 +7234,20 @@ class DeepAgentsApp(App):
                 provider = detect_provider(model_spec)
 
             # Check credentials
-            has_creds = has_provider_credentials(provider) if provider else None
-            if has_creds is False and provider is not None:
-                env_var = get_credential_env_var(provider)
-                detail = (
-                    f"{env_var} is not set or is empty"
-                    if env_var
-                    else (
-                        f"provider '{provider}' is not recognized. "
-                        "Add it to ~/.deepagents/config.toml with an "
-                        "api_key_env field"
+            auth_status = get_provider_auth_status(provider) if provider else None
+            if auth_status is not None and auth_status.blocks_start:
+                await self._mount_message(
+                    ErrorMessage(
+                        f"Missing credentials: {auth_status.missing_detail()}\n\n"
+                        f"Run `/auth` for the '{auth_status.provider}' provider, then "
+                        f"re-issue `/model {model_spec}`."
                     )
                 )
-                await self._mount_message(
-                    ErrorMessage(f"Missing credentials: {detail}")
-                )
                 return
-            if has_creds is None and provider:
+            if (
+                auth_status is not None
+                and auth_status.state is ProviderAuthState.UNKNOWN
+            ):
                 logger.debug(
                     "Credentials for provider '%s' cannot be verified;"
                     " proceeding anyway",
@@ -7236,7 +7289,7 @@ class DeepAgentsApp(App):
             except Exception as exc:
                 logger.exception("Failed to resolve model metadata for %s", display)
                 await self._mount_message(
-                    ErrorMessage(f"Failed to switch model: {exc}")
+                    ErrorMessage(_build_model_switch_error_body(exc))
                 )
                 return
 
@@ -7294,11 +7347,7 @@ class DeepAgentsApp(App):
             extra_kwargs: Extra constructor kwargs from `--model-params`.
         """
         from deepagents_cli.config import detect_provider
-        from deepagents_cli.model_config import (
-            ModelSpec,
-            get_credential_env_var,
-            has_provider_credentials,
-        )
+        from deepagents_cli.model_config import ModelSpec, get_provider_auth_status
 
         if self._server_kwargs is None:
             await self._mount_message(
@@ -7314,22 +7363,14 @@ class DeepAgentsApp(App):
             model_name = model_spec
             provider = detect_provider(model_spec)
 
-        # Tri-state credentials check (`None` = unknown provider, treated as
-        # proceed); bail early so retrying with still-missing creds doesn't
+        # Tri-state credentials check (`UNKNOWN` = unknown provider, treated
+        # as proceed); bail early so retrying with still-missing creds doesn't
         # loop right back into the same `MissingCredentialsError`.
-        has_creds = has_provider_credentials(provider) if provider else None
-        if has_creds is False and provider is not None:
-            env_var = get_credential_env_var(provider)
-            detail = (
-                f"{env_var} is not set or is empty"
-                if env_var
-                else (
-                    f"provider '{provider}' is not recognized. "
-                    "Add it to ~/.deepagents/config.toml with an "
-                    "api_key_env field"
-                )
+        auth_status = get_provider_auth_status(provider) if provider else None
+        if auth_status is not None and auth_status.blocks_start:
+            await self._mount_message(
+                ErrorMessage(f"Missing credentials: {auth_status.missing_detail()}")
             )
-            await self._mount_message(ErrorMessage(f"Missing credentials: {detail}"))
             return
 
         display = model_spec
