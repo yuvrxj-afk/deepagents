@@ -187,6 +187,13 @@ if _IS_ITERM:
 def _load_theme_preference() -> str:
     """Load the forced or saved theme name, or return the default.
 
+    Resolution order:
+
+    1. ``DEEPAGENTS_CLI_THEME`` env var (explicit override).
+    2. ``[ui].theme`` in ``~/.deepagents/config.toml`` (saved preference).
+    3. ``[ui.terminal_themes]`` mapping keyed by ``TERM_PROGRAM`` (smart default).
+    4. :data:`theme.DEFAULT_THEME`.
+
     Returns:
         A Textual theme name (e.g., `'langchain'`, `'langchain-light'`).
     """
@@ -236,6 +243,22 @@ def _load_theme_preference() -> str:
             "Unknown theme '%s' in config; falling back to default",
             name,
         )
+
+    terminal_themes = data.get("ui", {}).get("terminal_themes")
+    if isinstance(terminal_themes, dict):
+        term_program = os.environ.get("TERM_PROGRAM")
+        if term_program is not None:
+            mapped = terminal_themes.get(term_program)
+            if isinstance(mapped, str) and mapped in theme.get_registry():
+                return mapped
+            if isinstance(mapped, str):
+                logger.warning(
+                    "Unknown theme '%s' mapped to TERM_PROGRAM='%s' "
+                    "in [ui.terminal_themes]; ignoring",
+                    mapped,
+                    term_program,
+                )
+
     return theme.DEFAULT_THEME
 
 
