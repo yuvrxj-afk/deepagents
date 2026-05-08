@@ -6080,20 +6080,39 @@ class DeepAgentsApp(App):
 
     def action_toggle_tool_output(self) -> None:
         """Toggle expand/collapse of the most recent tool output or skill body."""
-        # Try skill messages first (most recent collapsible content)
-        with suppress(NoMatches):
-            skill_messages = list(self.query(SkillMessage))
-            for skill_msg in reversed(skill_messages):
-                if skill_msg._stripped_body.strip():
-                    skill_msg.toggle_body()
-                    return
-        # Fall back to tool messages with output
-        with suppress(NoMatches):
-            tool_messages = list(self.query(ToolCallMessage))
+        # Pending ask_user takes precedence so Ctrl+O toggles the question card.
+        if self._pending_ask_user_widget is not None:
+            try:
+                tool_messages = list(self.query(ToolCallMessage))
+            except NoMatches:
+                tool_messages = []
             for tool_msg in reversed(tool_messages):
-                if tool_msg.has_output:
-                    tool_msg.toggle_output()
+                if tool_msg.has_expandable_args:
+                    tool_msg.toggle_args()
                     return
+
+        # Try skill messages first (most recent collapsible content)
+        try:
+            skill_messages = list(self.query(SkillMessage))
+        except NoMatches:
+            skill_messages = []
+        for skill_msg in reversed(skill_messages):
+            if skill_msg._stripped_body.strip():
+                skill_msg.toggle_body()
+                return
+
+        # Fall back to tool messages with output or expandable args
+        try:
+            tool_messages = list(self.query(ToolCallMessage))
+        except NoMatches:
+            tool_messages = []
+        for tool_msg in reversed(tool_messages):
+            if tool_msg.has_output:
+                tool_msg.toggle_output()
+                return
+            if tool_msg.has_expandable_args:
+                tool_msg.toggle_args()
+                return
 
     # Approval menu action handlers (delegated from App-level bindings)
     # NOTE: These only activate when approval widget is pending
