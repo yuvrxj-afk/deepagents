@@ -9,6 +9,7 @@ import os
 import shlex
 import signal
 import sys
+import threading
 import time
 import uuid
 import webbrowser
@@ -89,6 +90,14 @@ from deepagents_cli.widgets.welcome import WelcomeBanner
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
+
+# Serializes read-modify-write of `~/.deepagents/config.toml` between
+# `save_theme_preference` and `save_terminal_theme_mapping`. Without this,
+# pressing `t` (per-terminal mapping) and Enter (global theme) in quick
+# succession would race two writers over the same file: each reads the
+# pre-mutation state, then the second writer's dump clobbers the first
+# writer's keys.
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 ScreenResultT = TypeVar("ScreenResultT")
 
@@ -198,8 +207,8 @@ def _resolve_theme_name(value: object) -> str | None:
 
     Returns:
         The canonical registry key, or `None` if the value is not a string or
-        does not match any registered theme by key or label
-        (case-insensitive).
+            does not match any registered theme by key or label
+            (case-insensitive).
     """
     if not isinstance(value, str):
         return None
@@ -216,39 +225,94 @@ def _resolve_theme_name(value: object) -> str | None:
     return None
 
 
+def _resolve_terminal_mapping(ui: dict[str, Any]) -> str | None:
+    """Resolve `[ui.terminal_themes][TERM_PROGRAM]` to a registered theme.
+
+    Centralizes both the lookup and the misconfiguration warnings shared by
+    `_load_theme_preference` (startup) and `_load_terminal_default` (picker
+    badge). Misconfiguration is logged exactly once per call.
+
+    Args:
+        ui: The `[ui]` table parsed from `config.toml`.
+
+    Returns:
+        The canonical registry key, or `None` if `terminal_themes` is absent,
+            malformed, references an unknown theme, or `TERM_PROGRAM` is unset
+            despite a non-empty mapping.
+    """
+    terminal_themes = ui.get("terminal_themes")
+    if terminal_themes is None:
+        return None
+    if not isinstance(terminal_themes, dict):
+        logger.warning(
+            "[ui.terminal_themes] should be a table mapping TERM_PROGRAM "
+            "values to theme names; got %s",
+            type(terminal_themes).__name__,
+        )
+        return None
+    term_program = os.environ.get("TERM_PROGRAM", "").strip()
+    if not term_program:
+        if terminal_themes:
+            logger.warning(
+                "[ui.terminal_themes] is configured but TERM_PROGRAM is unset; "
+                "no per-terminal theme will be applied",
+            )
+        return None
+    mapped = terminal_themes.get(term_program)
+    resolved = _resolve_theme_name(mapped)
+    if resolved is not None:
+        return resolved
+    if isinstance(mapped, str):
+        logger.warning(
+            "Unknown theme '%s' mapped to TERM_PROGRAM='%s' "
+            "in [ui.terminal_themes]; ignoring",
+            mapped,
+            term_program,
+        )
+    elif mapped is not None:
+        logger.warning(
+            "Expected string theme name for TERM_PROGRAM='%s' in "
+            "[ui.terminal_themes], got %s; ignoring",
+            term_program,
+            type(mapped).__name__,
+        )
+    return None
+
+
 def _load_terminal_default() -> str | None:
     """Return the saved default theme for the current `TERM_PROGRAM`.
 
     Reads `[ui.terminal_themes][TERM_PROGRAM]` from `config.toml` and
     resolves the value via `_resolve_theme_name`, so labels and case variants
     are accepted. Used by `ThemeSelectorScreen` to badge the matching option
-    with `(terminal default)`.
+    with `(default)`.
 
     Returns:
-        The canonical registry key, or `None` if `TERM_PROGRAM` is unset,
-            the file is missing or unreadable, no mapping is set, or the mapped
-            value doesn't match a registered theme.
+        The canonical registry key, or `None` if `TERM_PROGRAM` is unset, the
+            file is missing/unreadable, no mapping is set, or the mapped value
+            doesn't match a registered theme. Read errors and misconfigurations
+            are logged at WARNING.
     """
-    term_program = os.environ.get("TERM_PROGRAM", "").strip()
-    if not term_program:
+    if not os.environ.get("TERM_PROGRAM", "").strip():
         return None
 
     import tomllib
 
-    try:
-        from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
+    from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
 
-        if not DEFAULT_CONFIG_PATH.exists():
-            return None
+    if not DEFAULT_CONFIG_PATH.exists():
+        return None
+    try:
         with DEFAULT_CONFIG_PATH.open("rb") as f:
             data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, PermissionError, OSError):
+    except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
+        logger.warning("Could not read config for terminal theme default: %s", exc)
         return None
 
-    terminal_themes = data.get("ui", {}).get("terminal_themes")
-    if not isinstance(terminal_themes, dict):
+    ui = data.get("ui")
+    if not isinstance(ui, dict):
         return None
-    return _resolve_theme_name(terminal_themes.get(term_program))
+    return _resolve_terminal_mapping(ui)
 
 
 def _load_theme_preference() -> str:
@@ -283,12 +347,11 @@ def _load_theme_preference() -> str:
 
     import tomllib
 
+    from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return theme.DEFAULT_THEME
     try:
-        from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
-
-        if not DEFAULT_CONFIG_PATH.exists():
-            return theme.DEFAULT_THEME
-
         with DEFAULT_CONFIG_PATH.open("rb") as f:
             data = tomllib.load(f)
     except (tomllib.TOMLDecodeError, PermissionError, OSError) as exc:
@@ -296,35 +359,12 @@ def _load_theme_preference() -> str:
         return theme.DEFAULT_THEME
 
     ui = data.get("ui", {})
+    if not isinstance(ui, dict):
+        return theme.DEFAULT_THEME
 
-    terminal_themes = ui.get("terminal_themes")
-    if isinstance(terminal_themes, dict):
-        term_program = os.environ.get("TERM_PROGRAM")
-        if term_program:
-            mapped = terminal_themes.get(term_program)
-            resolved = _resolve_theme_name(mapped)
-            if resolved is not None:
-                return resolved
-            if isinstance(mapped, str):
-                logger.warning(
-                    "Unknown theme '%s' mapped to TERM_PROGRAM='%s' "
-                    "in [ui.terminal_themes]; ignoring",
-                    mapped,
-                    term_program,
-                )
-            elif mapped is not None:
-                logger.warning(
-                    "Expected string theme name for TERM_PROGRAM='%s' in "
-                    "[ui.terminal_themes], got %s; ignoring",
-                    term_program,
-                    type(mapped).__name__,
-                )
-    elif terminal_themes is not None:
-        logger.warning(
-            "[ui.terminal_themes] should be a table mapping TERM_PROGRAM "
-            "values to theme names; got %s",
-            type(terminal_themes).__name__,
-        )
+    resolved = _resolve_terminal_mapping(ui)
+    if resolved is not None:
+        return resolved
 
     saved = ui.get("theme")
     resolved = _resolve_theme_name(saved)
@@ -354,35 +394,37 @@ def save_theme_preference(name: str) -> bool:
 
     import contextlib
     import tempfile
+    import tomllib
 
     try:
-        import tomllib
-
         import tomli_w
 
         from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
 
         DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if DEFAULT_CONFIG_PATH.exists():
-            with DEFAULT_CONFIG_PATH.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
+        with _CONFIG_WRITE_LOCK:
+            if DEFAULT_CONFIG_PATH.exists():
+                with DEFAULT_CONFIG_PATH.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
 
-        if "ui" not in data:
-            data["ui"] = {}
-        data["ui"]["theme"] = name
+            if "ui" not in data:
+                data["ui"] = {}
+            data["ui"]["theme"] = name
 
-        fd, tmp_path = tempfile.mkstemp(dir=DEFAULT_CONFIG_PATH.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
-    except Exception:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=DEFAULT_CONFIG_PATH.parent, suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
+    except (OSError, tomllib.TOMLDecodeError, ImportError, TypeError, ValueError):
         logger.exception("Could not save theme preference")
         return False
     return True
@@ -417,45 +459,46 @@ def save_terminal_theme_mapping(term_program: str, name: str) -> bool:
 
     import contextlib
     import tempfile
+    import tomllib
 
     try:
-        import tomllib
-
         import tomli_w
 
         from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
 
         DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if DEFAULT_CONFIG_PATH.exists():
-            with DEFAULT_CONFIG_PATH.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
+        with _CONFIG_WRITE_LOCK:
+            if DEFAULT_CONFIG_PATH.exists():
+                with DEFAULT_CONFIG_PATH.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
 
-        ui = data.setdefault("ui", {})
-        terminal_themes = ui.get("terminal_themes")
-        if not isinstance(terminal_themes, dict):
-            if terminal_themes is not None:
-                logger.warning(
-                    "Existing [ui.terminal_themes] is not a table (got %r); "
-                    "replacing with a fresh table",
-                    terminal_themes,
-                )
-            terminal_themes = {}
-            ui["terminal_themes"] = terminal_themes
-        terminal_themes[term_program] = name
+            ui = data.setdefault("ui", {})
+            terminal_themes = ui.get("terminal_themes")
+            if not isinstance(terminal_themes, dict):
+                if terminal_themes is not None:
+                    logger.warning(
+                        "Existing [ui.terminal_themes] is not a table (got %r); "
+                        "replacing with a fresh table",
+                        terminal_themes,
+                    )
+                terminal_themes = {}
+                ui["terminal_themes"] = terminal_themes
+            terminal_themes[term_program] = name
 
-        # Atomic write: dump to a temp file in the same dir, then rename.
-        fd, tmp_path = tempfile.mkstemp(dir=DEFAULT_CONFIG_PATH.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
-    except Exception:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=DEFAULT_CONFIG_PATH.parent, suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
+    except (OSError, tomllib.TOMLDecodeError, ImportError, TypeError, ValueError):
         logger.exception("Could not save terminal theme mapping")
         return False
     return True

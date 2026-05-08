@@ -510,6 +510,68 @@ class TestLoadTerminalDefault:
 
         assert _load_terminal_default() is None
 
+    def test_returns_none_and_logs_on_corrupt_toml(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Corrupt config returns `None` and logs a warning so the user can debug."""
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text("this is not valid toml [[[")
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_terminal_default() is None
+        assert any(
+            "terminal theme default" in record.getMessage() for record in caplog.records
+        )
+
+    def test_warns_on_non_dict_terminal_themes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui]\nterminal_themes = "not-a-table"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_terminal_default() is None
+        assert any(
+            "[ui.terminal_themes]" in record.getMessage()
+            and "table" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_warns_on_unknown_mapped_theme(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui.terminal_themes]\n"Apple_Terminal" = "nonexistent"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_terminal_default() is None
+        assert any(
+            "nonexistent" in record.getMessage()
+            and "Apple_Terminal" in record.getMessage()
+            for record in caplog.records
+        )
+
 
 class TestLoadThemePreference:
     """_load_theme_preference reads config.toml correctly."""
@@ -778,8 +840,16 @@ class TestTerminalThemeMapping:
         )
 
     def test_missing_term_program_falls_through_to_default(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """Warn when mapping is non-empty but `TERM_PROGRAM` is unset.
+
+        Non-`TERM_PROGRAM` terminals (Windows Terminal, tmux without
+        passthrough, ssh, Linux console) shouldn't silently no-op.
+        """
         from deepagents_cli.app import _load_theme_preference
 
         config = tmp_path / "config.toml"
@@ -790,7 +860,38 @@ class TestTerminalThemeMapping:
         monkeypatch.delenv("TERM_PROGRAM", raising=False)
         monkeypatch.delenv(THEME, raising=False)
 
-        assert _load_theme_preference() == DEFAULT_THEME
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+
+        assert any(
+            "TERM_PROGRAM is unset" in record.getMessage() for record in caplog.records
+        )
+
+    def test_empty_terminal_themes_with_unset_term_program_no_warn(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No warning for an empty `[ui.terminal_themes]` table.
+
+        When `TERM_PROGRAM` is unset and the table is empty there's nothing
+        for the user to fix.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text("[ui.terminal_themes]\n")
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.delenv("TERM_PROGRAM", raising=False)
+        monkeypatch.delenv(THEME, raising=False)
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+
+        assert not any(
+            "TERM_PROGRAM is unset" in record.getMessage() for record in caplog.records
+        )
 
     def test_no_terminal_themes_section_falls_through(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1566,6 +1667,49 @@ class TestSaveTerminalThemeMapping:
         assert save_terminal_theme_mapping("   ", "langchain") is False
         assert not config.exists()
 
+    def test_returns_false_on_write_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mirror of `TestSaveThemePreference::test_returns_false_on_write_error`.
+
+        A read-only parent dir means `mkdir(exist_ok=True)` raises `OSError`,
+        which the function should catch and return `False` from.
+        """
+        from deepagents_cli.app import save_terminal_theme_mapping
+
+        config = tmp_path / "readonly" / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        (tmp_path / "readonly").mkdir()
+        (tmp_path / "readonly").chmod(0o444)
+        try:
+            result = save_terminal_theme_mapping("Apple_Terminal", "langchain")
+        finally:
+            (tmp_path / "readonly").chmod(0o755)
+        assert result is False
+
+    def test_returns_false_on_atomic_write_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clean up the temp file and return `False` on mid-write failure.
+
+        If `tomli_w.dump` raises, the temp file is unlinked. A stray
+        `.tmp` file in `~/.deepagents/` after a crash would be hard to
+        diagnose.
+        """
+        from deepagents_cli.app import save_terminal_theme_mapping
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            msg = "simulated dump failure"
+            raise OSError(msg)
+
+        monkeypatch.setattr("tomli_w.dump", _boom)
+        assert save_terminal_theme_mapping("Apple_Terminal", "langchain") is False
+        # Temp file (`*.tmp` sibling of the target) must not be left behind.
+        assert not list(tmp_path.glob("*.tmp"))
+
 
 # ---------------------------------------------------------------------------
 # ThemeSelectorScreen
@@ -1681,9 +1825,10 @@ class TestThemeSelectorScreen:
     ) -> None:
         """`t` persists the highlighted theme to `[ui.terminal_themes]` only.
 
-        Dismisses with `None` so the parent's save-theme-preference path
-        does not also write `[ui].theme` — that would race this writer over
-        the same `config.toml`.
+        Leaves the picker open so the user can confirm and keep browsing.
+        `[ui].theme` is intentionally untouched — pressing `t` is "save for
+        this terminal", not "save as my global default". The shared
+        `_CONFIG_WRITE_LOCK` prevents racing the parent's Enter writer.
         """
         import tomllib
 
@@ -1712,7 +1857,10 @@ class TestThemeSelectorScreen:
             await app.workers.wait_for_complete()
             await pilot.pause()
 
-        assert results == [None]
+            # Picker stays open after `t`.
+            assert results == []
+            assert app.screen is screen
+
         data = tomllib.loads(config.read_text())
         assert data["ui"]["terminal_themes"]["Apple_Terminal"] == "langchain"
         # `[ui].theme` must NOT be written by the `t` action — otherwise we'd
@@ -1753,6 +1901,43 @@ class TestThemeSelectorScreen:
 
         data = tomllib.loads(config.read_text())
         assert data["ui"]["terminal_themes"]["Apple_Terminal"] == target_key
+
+    async def test_t_updates_default_badge_in_place(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After `t`, the picker stays open and the saved row gains `(default)`.
+
+        Confirms the user's action visually so they don't need to reopen the
+        picker to verify what was saved.
+        """
+        from textual.app import App
+        from textual.widgets import OptionList
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+            screen = ThemeSelectorScreen(current_theme="langchain")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.press("t")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            registry = theme.get_registry()
+            keys = list(registry)
+            lc_index = keys.index("langchain")
+            option_list = screen.query_one("#theme-options", OptionList)
+            prompt = str(option_list.get_option_at_index(lc_index).prompt)
+            # `langchain` is both current and now the saved default.
+            assert "(current, default)" in prompt
+            # Cursor stays on the saved row.
+            assert option_list.highlighted == lc_index
 
     async def test_t_no_op_when_term_program_unset(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1816,8 +2001,98 @@ class TestThemeSelectorScreen:
         assert results == []
         assert not config.exists()
 
+    async def test_t_notifies_on_save_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Warn the user when `save_terminal_theme_mapping` returns `False`.
+
+        Surfaces a warning toast pointing at the log location instead of a
+        silent no-op.
+        """
+        from textual.app import App
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        # Force the writer to report failure without actually raising —
+        # exercises the `if ok:` else-branch in `_persist`.
+        monkeypatch.setattr(
+            "deepagents_cli.app.save_terminal_theme_mapping",
+            lambda *_args, **_kwargs: False,
+        )
+
+        notifications: list[tuple[str, str]] = []
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+
+            def _capture(
+                message: str, *, severity: str = "information", **_kwargs: object
+            ) -> None:
+                notifications.append((severity, message))
+
+            monkeypatch.setattr(app, "notify", _capture)
+
+            screen = ThemeSelectorScreen(current_theme="langchain")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.press("t")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        assert any(
+            sev == "warning" and "terminal mapping" in msg for sev, msg in notifications
+        )
+
+    async def test_t_notifies_on_save_exception(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Surface the exception class name in a toast on raise.
+
+        A generic 'check logs' message hides the failure mode; the class
+        name (e.g., `OSError`) tells the user where to look.
+        """
+        from textual.app import App
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            msg = "simulated"
+            raise OSError(msg)
+
+        monkeypatch.setattr("deepagents_cli.app.save_terminal_theme_mapping", _boom)
+
+        notifications: list[tuple[str, str]] = []
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+
+            def _capture(
+                message: str, *, severity: str = "information", **_kwargs: object
+            ) -> None:
+                notifications.append((severity, message))
+
+            monkeypatch.setattr(app, "notify", _capture)
+
+            screen = ThemeSelectorScreen(current_theme="langchain")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.press("t")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        assert any(sev == "error" and "OSError" in msg for sev, msg in notifications)
+
     async def test_terminal_default_badge_renders(self) -> None:
-        """The `terminal_default` row renders with a `(terminal default)` suffix."""
+        """The `terminal_default` row renders with a `(default)` suffix."""
         from textual.app import App
         from textual.widgets import OptionList
 
@@ -1842,11 +2117,11 @@ class TestThemeSelectorScreen:
                 f"{registry['langchain'].label} (current)"
             )
             assert str(option_list.get_option_at_index(default_idx).prompt) == (
-                f"{registry['langchain-light'].label} (terminal default)"
+                f"{registry['langchain-light'].label} (default)"
             )
 
     async def test_terminal_default_combines_with_current_badge(self) -> None:
-        """A theme that's both current and the terminal default renders both."""
+        """A theme that's both current and the saved default renders both."""
         from textual.app import App
         from textual.widgets import OptionList
 
@@ -1866,11 +2141,11 @@ class TestThemeSelectorScreen:
             lc_index = list(registry).index("langchain")
 
             assert str(option_list.get_option_at_index(lc_index).prompt) == (
-                f"{registry['langchain'].label} (current, terminal default)"
+                f"{registry['langchain'].label} (current, default)"
             )
 
     async def test_no_default_badge_when_terminal_default_is_none(self) -> None:
-        """Without a terminal mapping, no row gets a `(terminal default)` suffix."""
+        """Without a terminal mapping, no row gets a `(default)` suffix."""
         from textual.app import App
         from textual.widgets import OptionList
 
@@ -1886,7 +2161,10 @@ class TestThemeSelectorScreen:
             option_list = screen.query_one("#theme-options", OptionList)
             for i in range(option_list.option_count):
                 prompt = str(option_list.get_option_at_index(i).prompt)
-                assert "terminal default" not in prompt, prompt
+                # Match "(default)" as a whole token to avoid false positives
+                # from "(current)" rows.
+                assert "(default)" not in prompt, prompt
+                assert ", default)" not in prompt, prompt
 
     async def test_n_toggles_between_labels_and_registry_keys(self) -> None:
         """`n` swaps the option list between display labels and canonical keys.

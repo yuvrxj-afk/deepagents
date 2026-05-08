@@ -45,12 +45,9 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     selector screens (where Tab cycles focus across multiple widgets).
     `n` toggles between human-readable labels and canonical registry keys —
     the registry key is what `[ui.terminal_themes]` and `[ui].theme` accept,
-    so users editing config by hand can copy the exact value. `t` writes the
-    highlighted theme into `[ui.terminal_themes]` keyed on the current
-    `TERM_PROGRAM`, then closes the picker with the live preview committed —
-    `[ui].theme` is left untouched so the per-terminal mapping is the only
-    thing persisted (avoiding a concurrent-write race against the standard
-    Enter-to-save path).
+    so users editing config by hand can copy the exact value. `t` saves the
+    highlighted theme as the per-terminal default and updates the `(default)`
+    badge in place without closing the picker, so the user can keep browsing.
     """
 
     CSS = """
@@ -98,8 +95,8 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         Args:
             current_theme: The currently active theme name (to highlight).
             terminal_default: The theme saved in `[ui.terminal_themes]` for
-                the current `TERM_PROGRAM`, if any. Badged with
-                `(terminal default)` in the option list.
+                the current `TERM_PROGRAM`, if any. Badged with `(default)`
+                in the option list.
         """
         super().__init__()
         self._current_theme = current_theme
@@ -116,15 +113,15 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
 
         Returns:
             Either the human label or the registry key, with `(current)`
-                and/or `(terminal default)` suffixes — combined as
-                `(current, terminal default)` when both apply to the same theme.
+                and/or `(default)` suffixes — combined as
+                `(current, default)` when both apply to the same theme.
         """
         text = name if self._show_keys else entry.label
         suffixes: list[str] = []
         if name == self._current_theme:
             suffixes.append("current")
         if name == self._terminal_default:
-            suffixes.append("terminal default")
+            suffixes.append("default")
         if suffixes:
             text = f"{text} ({', '.join(suffixes)})"
         return text
@@ -222,16 +219,17 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     def action_set_for_terminal(self) -> None:
         """Persist the highlighted theme as the default for `TERM_PROGRAM`.
 
-        Writes `[ui.terminal_themes][TERM_PROGRAM] = name`, dismisses the
-        picker with `None`, and leaves the live preview applied. `[ui].theme`
-        is intentionally not touched — pressing `t` is "save for this
-        terminal", not "save as my global default". Dismissing with `None`
-        also avoids racing the parent app's save-on-Enter writer against this
-        action's writer over the same `config.toml`.
+        Writes `[ui.terminal_themes][TERM_PROGRAM] = name` and updates the
+        `(default)` badge in the option list without closing the picker, so
+        the user can confirm the change and keep browsing. `[ui].theme` is
+        intentionally not touched — pressing `t` is "save for this terminal",
+        not "save as my global default". The two save paths share a
+        `threading.Lock` (`_CONFIG_WRITE_LOCK` in `app.py`) so a quick
+        `t`-then-`Enter` can't race two writers over the same `config.toml`.
 
         No-ops with a warning toast if `TERM_PROGRAM` is unset, or silently
-        if nothing is highlighted / the highlighted id isn't a registered
-        theme (defensive guards — both branches are unreachable in practice).
+        if the option list has no highlighted entry / the highlighted id
+        isn't a registered theme.
         """
         term_program = os.environ.get("TERM_PROGRAM", "").strip()
         if not term_program:
@@ -246,14 +244,15 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
 
         option_list = self.query_one(OptionList)
         if option_list.highlighted is None:
+            logger.warning("action_set_for_terminal invoked with no highlighted option")
             return
         option = option_list.get_option_at_index(option_list.highlighted)
         name = option.id
         if name is None or name not in theme.get_registry():
+            logger.warning(
+                "action_set_for_terminal got unregistered option id '%s'", name
+            )
             return
-
-        # Dismiss synchronously so the worker can't race a later Esc/Enter.
-        self.dismiss(None)
 
         async def _persist() -> None:
             try:
@@ -262,32 +261,40 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
                 ok = await asyncio.to_thread(
                     save_terminal_theme_mapping, term_program, name
                 )
-            except Exception:
+            except (OSError, ImportError) as exc:
                 logger.exception("Failed to persist terminal theme mapping")
                 self.app.notify(
-                    "Could not save terminal mapping; check logs.",
+                    f"Could not save terminal mapping ({type(exc).__name__}); "
+                    "see logs in ~/.deepagents/logs/.",
                     severity="error",
                     markup=False,
                     timeout=6,
                 )
                 return
-            if ok:
+            if not ok:
                 self.app.notify(
-                    f"Set '{name}' as the default for {term_program}.",
-                    severity="information",
-                    markup=False,
-                    timeout=4,
-                )
-            else:
-                self.app.notify(
-                    "Could not save terminal mapping; check logs.",
+                    "Could not save terminal mapping; see logs in ~/.deepagents/logs/.",
                     severity="warning",
                     markup=False,
                     timeout=6,
                 )
+                return
+            # Update the badge in place if the screen is still mounted.
+            # The user may have dismissed the picker (Esc/Enter) while the
+            # write was in flight; `is_mounted` guards the widget tree.
+            if self.is_mounted:
+                self._terminal_default = name
+                self._rerender_options()
+            self.app.notify(
+                f"Set '{name}' as the default for {term_program}.",
+                severity="information",
+                markup=False,
+                timeout=4,
+            )
 
-        # Anchor the worker on the app, not this screen — the screen is
-        # being dismissed and would tear down its own workers mid-flight.
+        # Anchor the worker on the app, not this screen — if the user
+        # dismisses the picker mid-flight, the screen tears down its own
+        # workers but the write should still complete and toast.
         self.app.run_worker(_persist(), exclusive=False)
 
     def action_toggle_names(self) -> None:
@@ -297,6 +304,15 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         `[ui].theme` without leaving the picker.
         """
         self._show_keys = not self._show_keys
+        self._rerender_options()
+
+    def _rerender_options(self) -> None:
+        """Rebuild the option list, preserving the cursor position.
+
+        Used when the badge text or label/key mode changes — Textual's
+        `OptionList` doesn't expose a way to mutate a rendered prompt, so
+        we recreate the options.
+        """
         option_list = self.query_one(OptionList)
         cursor = option_list.highlighted
         registry = theme.get_registry()
