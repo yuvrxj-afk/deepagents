@@ -216,6 +216,41 @@ def _resolve_theme_name(value: object) -> str | None:
     return None
 
 
+def _load_terminal_default() -> str | None:
+    """Return the saved default theme for the current `TERM_PROGRAM`.
+
+    Reads `[ui.terminal_themes][TERM_PROGRAM]` from `config.toml` and
+    resolves the value via `_resolve_theme_name`, so labels and case variants
+    are accepted. Used by `ThemeSelectorScreen` to badge the matching option
+    with `(terminal default)`.
+
+    Returns:
+        The canonical registry key, or `None` if `TERM_PROGRAM` is unset,
+            the file is missing or unreadable, no mapping is set, or the mapped
+            value doesn't match a registered theme.
+    """
+    term_program = os.environ.get("TERM_PROGRAM", "").strip()
+    if not term_program:
+        return None
+
+    import tomllib
+
+    try:
+        from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
+
+        if not DEFAULT_CONFIG_PATH.exists():
+            return None
+        with DEFAULT_CONFIG_PATH.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, PermissionError, OSError):
+        return None
+
+    terminal_themes = data.get("ui", {}).get("terminal_themes")
+    if not isinstance(terminal_themes, dict):
+        return None
+    return _resolve_theme_name(terminal_themes.get(term_program))
+
+
 def _load_theme_preference() -> str:
     """Load the forced or saved theme name, or return the default.
 
@@ -6596,7 +6631,10 @@ class DeepAgentsApp(App):
             if self._chat_input:
                 self._chat_input.focus_input()
 
-        screen = ThemeSelectorScreen(current_theme=self.theme)
+        screen = ThemeSelectorScreen(
+            current_theme=self.theme,
+            terminal_default=_load_terminal_default(),
+        )
         self.push_screen(screen, handle_result)
 
     async def _show_agent_selector(self) -> None:

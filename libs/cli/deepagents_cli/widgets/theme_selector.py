@@ -92,15 +92,19 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     """
     """Styling for the centered modal shell, title, option list, and help footer."""
 
-    def __init__(self, current_theme: str) -> None:
+    def __init__(self, current_theme: str, terminal_default: str | None = None) -> None:
         """Initialize the ThemeSelectorScreen.
 
         Args:
             current_theme: The currently active theme name (to highlight).
+            terminal_default: The theme saved in `[ui.terminal_themes]` for
+                the current `TERM_PROGRAM`, if any. Badged with
+                `(terminal default)` in the option list.
         """
         super().__init__()
         self._current_theme = current_theme
         self._original_theme = current_theme
+        self._terminal_default = terminal_default
         self._show_keys = False
 
     def _format_option(self, name: str, entry: theme.ThemeEntry) -> str:
@@ -111,12 +115,18 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
             entry: Registry entry.
 
         Returns:
-            Either the human label or the registry key, with a `(current)`
-            suffix on the active theme.
+            Either the human label or the registry key, with `(current)`
+                and/or `(terminal default)` suffixes — combined as
+                `(current, terminal default)` when both apply to the same theme.
         """
         text = name if self._show_keys else entry.label
+        suffixes: list[str] = []
         if name == self._current_theme:
-            text = f"{text} (current)"
+            suffixes.append("current")
+        if name == self._terminal_default:
+            suffixes.append("terminal default")
+        if suffixes:
+            text = f"{text} ({', '.join(suffixes)})"
         return text
 
     def compose(self) -> ComposeResult:

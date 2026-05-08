@@ -432,6 +432,85 @@ class TestResolveThemeName:
         assert _resolve_theme_name(["langchain"]) is None
 
 
+class TestLoadTerminalDefault:
+    """Direct unit tests for `_load_terminal_default`."""
+
+    def test_returns_mapped_theme(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        assert _load_terminal_default() == "langchain-light"
+
+    def test_resolves_label_via_resolve_theme_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui.terminal_themes]\n"Apple_Terminal" = "LangChain Dark"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        assert _load_terminal_default() == "langchain"
+
+    def test_returns_none_when_term_program_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.delenv("TERM_PROGRAM", raising=False)
+
+        assert _load_terminal_default() is None
+
+    def test_returns_none_when_no_mapping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui.terminal_themes]\n"iTerm.app" = "langchain"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        assert _load_terminal_default() is None
+
+    def test_returns_none_when_mapped_theme_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui.terminal_themes]\n"Apple_Terminal" = "nonexistent"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        assert _load_terminal_default() is None
+
+    def test_returns_none_when_config_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        assert _load_terminal_default() is None
+
+
 class TestLoadThemePreference:
     """_load_theme_preference reads config.toml correctly."""
 
@@ -1736,6 +1815,78 @@ class TestThemeSelectorScreen:
 
         assert results == []
         assert not config.exists()
+
+    async def test_terminal_default_badge_renders(self) -> None:
+        """The `terminal_default` row renders with a `(terminal default)` suffix."""
+        from textual.app import App
+        from textual.widgets import OptionList
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+            screen = ThemeSelectorScreen(
+                current_theme="langchain", terminal_default="langchain-light"
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+
+            option_list = screen.query_one("#theme-options", OptionList)
+            registry = theme.get_registry()
+            keys = list(registry)
+            current_idx = keys.index("langchain")
+            default_idx = keys.index("langchain-light")
+
+            assert str(option_list.get_option_at_index(current_idx).prompt) == (
+                f"{registry['langchain'].label} (current)"
+            )
+            assert str(option_list.get_option_at_index(default_idx).prompt) == (
+                f"{registry['langchain-light'].label} (terminal default)"
+            )
+
+    async def test_terminal_default_combines_with_current_badge(self) -> None:
+        """A theme that's both current and the terminal default renders both."""
+        from textual.app import App
+        from textual.widgets import OptionList
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+            screen = ThemeSelectorScreen(
+                current_theme="langchain", terminal_default="langchain"
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+
+            option_list = screen.query_one("#theme-options", OptionList)
+            registry = theme.get_registry()
+            lc_index = list(registry).index("langchain")
+
+            assert str(option_list.get_option_at_index(lc_index).prompt) == (
+                f"{registry['langchain'].label} (current, terminal default)"
+            )
+
+    async def test_no_default_badge_when_terminal_default_is_none(self) -> None:
+        """Without a terminal mapping, no row gets a `(terminal default)` suffix."""
+        from textual.app import App
+        from textual.widgets import OptionList
+
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+            screen = ThemeSelectorScreen(current_theme="langchain")
+            app.push_screen(screen)
+            await pilot.pause()
+
+            option_list = screen.query_one("#theme-options", OptionList)
+            for i in range(option_list.option_count):
+                prompt = str(option_list.get_option_at_index(i).prompt)
+                assert "terminal default" not in prompt, prompt
 
     async def test_n_toggles_between_labels_and_registry_keys(self) -> None:
         """`n` swaps the option list between display labels and canonical keys.
