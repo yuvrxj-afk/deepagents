@@ -184,27 +184,35 @@ if _IS_ITERM:
     atexit.register(_restore_cursor_guide)
 
 
-def _resolve_config_theme(value: object) -> str | None:
-    """Resolve a theme name read from `config.toml`.
+def _resolve_theme_name(value: object) -> str | None:
+    """Resolve a user-supplied theme name to a canonical registry key.
 
-    Applies the legacy `textual-ansi` migration (pre-Textual 8.2.5) and
-    requires an exact registry-key match. Config-file values are written by the
-    CLI itself, so case/label tolerance is intentionally narrower than the
-    `DEEPAGENTS_CLI_THEME` env-var path.
+    Accepts the registry key or the human-readable label, case-insensitive
+    on both, with surrounding whitespace stripped — config values
+    (especially `[ui.terminal_themes]`) and the `DEEPAGENTS_CLI_THEME`
+    env var are commonly hand-edited. Also applies the legacy
+    `textual-ansi` → `ansi-light` migration (pre-Textual 8.2.5).
 
     Args:
-        value: Raw value read from TOML.
+        value: Raw value read from TOML or an environment variable.
 
     Returns:
         The canonical registry key, or `None` if the value is not a string or
-        does not match a registered theme.
+        does not match any registered theme by key or label
+        (case-insensitive).
     """
     if not isinstance(value, str):
         return None
-    if value == "textual-ansi":
-        value = "ansi-light"
-    if value in theme.get_registry():
-        return value
+    name = value.strip()
+    if name == "textual-ansi":
+        name = "ansi-light"
+    registry = theme.get_registry()
+    if name in registry:
+        return name
+    folded = name.casefold()
+    for registered, entry in registry.items():
+        if registered.casefold() == folded or entry.label.casefold() == folded:
+            return registered
     return None
 
 
@@ -228,16 +236,9 @@ def _load_theme_preference() -> str:
 
     env_name = os.environ.get(THEME)
     if env_name is not None:
-        name = env_name.strip()
-        registry = theme.get_registry()
-        if name in registry:
-            return name
-        for registered, entry in registry.items():
-            if (
-                registered.casefold() == name.casefold()
-                or entry.label.casefold() == name.casefold()
-            ):
-                return registered
+        resolved = _resolve_theme_name(env_name)
+        if resolved is not None:
+            return resolved
         logger.warning(
             "Unknown theme '%s' in %s; falling back to default",
             env_name,
@@ -266,7 +267,7 @@ def _load_theme_preference() -> str:
         term_program = os.environ.get("TERM_PROGRAM")
         if term_program:
             mapped = terminal_themes.get(term_program)
-            resolved = _resolve_config_theme(mapped)
+            resolved = _resolve_theme_name(mapped)
             if resolved is not None:
                 return resolved
             if isinstance(mapped, str):
@@ -291,7 +292,7 @@ def _load_theme_preference() -> str:
         )
 
     saved = ui.get("theme")
-    resolved = _resolve_config_theme(saved)
+    resolved = _resolve_theme_name(saved)
     if resolved is not None:
         return resolved
     if isinstance(saved, str):
@@ -348,6 +349,79 @@ def save_theme_preference(name: str) -> bool:
             raise
     except Exception:
         logger.exception("Could not save theme preference")
+        return False
+    return True
+
+
+def save_terminal_theme_mapping(term_program: str, name: str) -> bool:
+    """Persist a `[ui.terminal_themes][term_program] = name` entry.
+
+    The write is atomic (temp file + `Path.replace`) to avoid corrupting
+    `config.toml` on crash or SIGINT. Mirrors `save_theme_preference`.
+
+    Args:
+        term_program: Value of the `TERM_PROGRAM` environment variable to key
+            on. Whitespace is stripped; the trimmed value is matched verbatim
+            against `os.environ["TERM_PROGRAM"]` at lookup time.
+        name: Theme name to map. Validated as an exact registry-key match —
+            labels and case variants are rejected here because the picker
+            writes canonical keys.
+
+    Returns:
+        `True` if the mapping was saved, `False` if `name` isn't a registered
+            theme, `term_program` is empty after stripping, or any error
+            occurred.
+    """
+    if name not in theme.get_registry():
+        logger.warning("Refusing to map unknown theme '%s'", name)
+        return False
+    term_program = term_program.strip()
+    if not term_program:
+        logger.warning("Refusing to save terminal mapping with empty TERM_PROGRAM")
+        return False
+
+    import contextlib
+    import tempfile
+
+    try:
+        import tomllib
+
+        import tomli_w
+
+        from deepagents_cli.model_config import DEFAULT_CONFIG_PATH
+
+        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if DEFAULT_CONFIG_PATH.exists():
+            with DEFAULT_CONFIG_PATH.open("rb") as f:
+                data = tomllib.load(f)
+        else:
+            data = {}
+
+        ui = data.setdefault("ui", {})
+        terminal_themes = ui.get("terminal_themes")
+        if not isinstance(terminal_themes, dict):
+            if terminal_themes is not None:
+                logger.warning(
+                    "Existing [ui.terminal_themes] is not a table (got %r); "
+                    "replacing with a fresh table",
+                    terminal_themes,
+                )
+            terminal_themes = {}
+            ui["terminal_themes"] = terminal_themes
+        terminal_themes[term_program] = name
+
+        # Atomic write: dump to a temp file in the same dir, then rename.
+        fd, tmp_path = tempfile.mkstemp(dir=DEFAULT_CONFIG_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                tomli_w.dump(data, f)
+            Path(tmp_path).replace(DEFAULT_CONFIG_PATH)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                Path(tmp_path).unlink()
+            raise
+    except Exception:
+        logger.exception("Could not save terminal theme mapping")
         return False
     return True
 

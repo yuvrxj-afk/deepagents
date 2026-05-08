@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING, ClassVar
 
 from textual.binding import Binding, BindingType
@@ -32,6 +34,8 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         Binding("escape", "cancel", "Cancel", show=False),
         Binding("tab", "cursor_down", "Next", show=False, priority=True),
         Binding("shift+tab", "cursor_up", "Previous", show=False, priority=True),
+        Binding("n", "toggle_names", "Names", show=False),
+        Binding("t", "set_for_terminal", "Set for terminal", show=False),
     ]
     """Key bindings for the selector.
 
@@ -39,6 +43,14 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     handled natively by the embedded `OptionList`; Tab / Shift+Tab are bound
     here to advance the option list cursor for consistency with other
     selector screens (where Tab cycles focus across multiple widgets).
+    `n` toggles between human-readable labels and canonical registry keys —
+    the registry key is what `[ui.terminal_themes]` and `[ui].theme` accept,
+    so users editing config by hand can copy the exact value. `t` writes the
+    highlighted theme into `[ui.terminal_themes]` keyed on the current
+    `TERM_PROGRAM`, then closes the picker with the live preview committed —
+    `[ui].theme` is left untouched so the per-terminal mapping is the only
+    thing persisted (avoiding a concurrent-write race against the standard
+    Enter-to-save path).
     """
 
     CSS = """
@@ -71,7 +83,7 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     }
 
     ThemeSelectorScreen .theme-selector-help {
-        height: 1;
+        height: auto;
         color: $text-muted;
         text-style: italic;
         margin-top: 1;
@@ -89,6 +101,23 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         super().__init__()
         self._current_theme = current_theme
         self._original_theme = current_theme
+        self._show_keys = False
+
+    def _format_option(self, name: str, entry: theme.ThemeEntry) -> str:
+        """Render the option text for a theme entry.
+
+        Args:
+            name: Registry key.
+            entry: Registry entry.
+
+        Returns:
+            Either the human label or the registry key, with a `(current)`
+            suffix on the active theme.
+        """
+        text = name if self._show_keys else entry.label
+        if name == self._current_theme:
+            text = f"{text} (current)"
+        return text
 
     def compose(self) -> ComposeResult:
         """Compose the screen layout.
@@ -101,23 +130,22 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         highlight_index = 0
 
         for i, (name, entry) in enumerate(theme.get_registry().items()):
-            label = entry.label
+            options.append(Option(self._format_option(name, entry), id=name))
             if name == self._current_theme:
-                label = f"{label} (current)"
                 highlight_index = i
-            options.append(Option(label, id=name))
 
         with Vertical():
             yield Static("Select Theme", classes="theme-selector-title")
             option_list = OptionList(*options, id="theme-options")
             option_list.highlighted = highlight_index
             yield option_list
-            help_text = (
+            nav_line = (
                 f"{glyphs.arrow_up}/{glyphs.arrow_down} or Tab switch"
                 f" {glyphs.bullet} Enter select"
                 f" {glyphs.bullet} Esc cancel"
             )
-            yield Static(help_text, classes="theme-selector-help")
+            action_line = "N labels/keys  •  T set for this terminal"
+            yield Static(f"{nav_line}\n{action_line}", classes="theme-selector-help")
 
     def on_mount(self) -> None:
         """Apply ASCII border if needed."""
@@ -180,3 +208,93 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     def action_cursor_up(self) -> None:
         """Move the option list cursor up (Shift+Tab)."""
         self.query_one(OptionList).action_cursor_up()
+
+    def action_set_for_terminal(self) -> None:
+        """Persist the highlighted theme as the default for `TERM_PROGRAM`.
+
+        Writes `[ui.terminal_themes][TERM_PROGRAM] = name`, dismisses the
+        picker with `None`, and leaves the live preview applied. `[ui].theme`
+        is intentionally not touched — pressing `t` is "save for this
+        terminal", not "save as my global default". Dismissing with `None`
+        also avoids racing the parent app's save-on-Enter writer against this
+        action's writer over the same `config.toml`.
+
+        No-ops with a warning toast if `TERM_PROGRAM` is unset, or silently
+        if nothing is highlighted / the highlighted id isn't a registered
+        theme (defensive guards — both branches are unreachable in practice).
+        """
+        term_program = os.environ.get("TERM_PROGRAM", "").strip()
+        if not term_program:
+            self.app.notify(
+                "TERM_PROGRAM is unset; can't set a per-terminal default. "
+                "Set the [ui].theme directly with Enter.",
+                severity="warning",
+                markup=False,
+                timeout=6,
+            )
+            return
+
+        option_list = self.query_one(OptionList)
+        if option_list.highlighted is None:
+            return
+        option = option_list.get_option_at_index(option_list.highlighted)
+        name = option.id
+        if name is None or name not in theme.get_registry():
+            return
+
+        # Dismiss synchronously so the worker can't race a later Esc/Enter.
+        self.dismiss(None)
+
+        async def _persist() -> None:
+            try:
+                from deepagents_cli.app import save_terminal_theme_mapping
+
+                ok = await asyncio.to_thread(
+                    save_terminal_theme_mapping, term_program, name
+                )
+            except Exception:
+                logger.exception("Failed to persist terminal theme mapping")
+                self.app.notify(
+                    "Could not save terminal mapping; check logs.",
+                    severity="error",
+                    markup=False,
+                    timeout=6,
+                )
+                return
+            if ok:
+                self.app.notify(
+                    f"Set '{name}' as the default for {term_program}.",
+                    severity="information",
+                    markup=False,
+                    timeout=4,
+                )
+            else:
+                self.app.notify(
+                    "Could not save terminal mapping; check logs.",
+                    severity="warning",
+                    markup=False,
+                    timeout=6,
+                )
+
+        # Anchor the worker on the app, not this screen — the screen is
+        # being dismissed and would tear down its own workers mid-flight.
+        self.app.run_worker(_persist(), exclusive=False)
+
+    def action_toggle_names(self) -> None:
+        """Toggle between human labels and registry keys in the option list.
+
+        Useful for copying the canonical key into `[ui.terminal_themes]` or
+        `[ui].theme` without leaving the picker.
+        """
+        self._show_keys = not self._show_keys
+        option_list = self.query_one(OptionList)
+        cursor = option_list.highlighted
+        registry = theme.get_registry()
+        new_options = [
+            Option(self._format_option(name, entry), id=name)
+            for name, entry in registry.items()
+        ]
+        option_list.clear_options()
+        option_list.add_options(new_options)
+        if cursor is not None:
+            option_list.highlighted = cursor
