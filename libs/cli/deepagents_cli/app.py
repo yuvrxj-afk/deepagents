@@ -184,15 +184,42 @@ if _IS_ITERM:
     atexit.register(_restore_cursor_guide)
 
 
+def _resolve_config_theme(value: object) -> str | None:
+    """Resolve a theme name read from `config.toml`.
+
+    Applies the legacy `textual-ansi` migration (pre-Textual 8.2.5) and
+    requires an exact registry-key match. Config-file values are written by the
+    CLI itself, so case/label tolerance is intentionally narrower than the
+    `DEEPAGENTS_CLI_THEME` env-var path.
+
+    Args:
+        value: Raw value read from TOML.
+
+    Returns:
+        The canonical registry key, or `None` if the value is not a string or
+        does not match a registered theme.
+    """
+    if not isinstance(value, str):
+        return None
+    if value == "textual-ansi":
+        value = "ansi-light"
+    if value in theme.get_registry():
+        return value
+    return None
+
+
 def _load_theme_preference() -> str:
     """Load the forced or saved theme name, or return the default.
 
     Resolution order:
 
-    1. ``DEEPAGENTS_CLI_THEME`` env var (explicit override).
-    2. ``[ui].theme`` in ``~/.deepagents/config.toml`` (saved preference).
-    3. ``[ui.terminal_themes]`` mapping keyed by ``TERM_PROGRAM`` (smart default).
-    4. :data:`theme.DEFAULT_THEME`.
+    1. `DEEPAGENTS_CLI_THEME` env var (explicit override).
+    2. `[ui].theme` in `~/.deepagents/config.toml` (saved preference). An
+        invalid value here returns the default — the user's explicit choice is
+        not silently overridden by the terminal mapping.
+    3. `[ui.terminal_themes]` mapping keyed by `TERM_PROGRAM` (smart default,
+        consulted only when no `[ui].theme` is set).
+    4. `theme.DEFAULT_THEME`.
 
     Returns:
         A Textual theme name (e.g., `'langchain'`, `'langchain-light'`).
@@ -232,25 +259,27 @@ def _load_theme_preference() -> str:
         logger.warning("Could not read config for theme preference: %s", exc)
         return theme.DEFAULT_THEME
 
-    name = data.get("ui", {}).get("theme")
-    # Migrate legacy `textual-ansi` preference (pre-Textual 8.2.5) to `ansi-light`.
-    if name == "textual-ansi":
-        name = "ansi-light"
-    if isinstance(name, str) and name in theme.get_registry():
-        return name
-    if isinstance(name, str):
+    ui = data.get("ui", {})
+
+    saved = ui.get("theme")
+    resolved = _resolve_config_theme(saved)
+    if resolved is not None:
+        return resolved
+    if isinstance(saved, str):
         logger.warning(
             "Unknown theme '%s' in config; falling back to default",
-            name,
+            saved,
         )
+        return theme.DEFAULT_THEME
 
-    terminal_themes = data.get("ui", {}).get("terminal_themes")
+    terminal_themes = ui.get("terminal_themes")
     if isinstance(terminal_themes, dict):
         term_program = os.environ.get("TERM_PROGRAM")
-        if term_program is not None:
+        if term_program:
             mapped = terminal_themes.get(term_program)
-            if isinstance(mapped, str) and mapped in theme.get_registry():
-                return mapped
+            resolved = _resolve_config_theme(mapped)
+            if resolved is not None:
+                return resolved
             if isinstance(mapped, str):
                 logger.warning(
                     "Unknown theme '%s' mapped to TERM_PROGRAM='%s' "
@@ -258,6 +287,19 @@ def _load_theme_preference() -> str:
                     mapped,
                     term_program,
                 )
+            elif mapped is not None:
+                logger.warning(
+                    "Expected string theme name for TERM_PROGRAM='%s' in "
+                    "[ui.terminal_themes], got %s; ignoring",
+                    term_program,
+                    type(mapped).__name__,
+                )
+    elif terminal_themes is not None:
+        logger.warning(
+            "[ui.terminal_themes] should be a table mapping TERM_PROGRAM "
+            "values to theme names; got %s",
+            type(terminal_themes).__name__,
+        )
 
     return theme.DEFAULT_THEME
 
@@ -5560,7 +5602,7 @@ class DeepAgentsApp(App):
         This method also stores the message data and handles pruning
         when the widget count exceeds the maximum.
 
-        If the ``#messages`` container is not present (e.g. the screen has
+        If the `#messages` container is not present (e.g. the screen has
         been torn down during an interruption), the call is silently skipped
         to avoid cascading `NoMatches` errors.
 

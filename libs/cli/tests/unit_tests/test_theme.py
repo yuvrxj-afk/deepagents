@@ -549,6 +549,23 @@ class TestTerminalThemeMapping:
 
         assert _load_theme_preference() == "langchain"
 
+    def test_unknown_saved_theme_returns_default_before_terminal_mapping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui]\ntheme = "nonexistent-theme"\n'
+            "[ui.terminal_themes]\n"
+            '"Apple_Terminal" = "langchain-light"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.delenv(THEME, raising=False)
+
+        assert _load_theme_preference() == DEFAULT_THEME
+
     def test_env_theme_overrides_terminal_mapping(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -580,7 +597,10 @@ class TestTerminalThemeMapping:
         assert _load_theme_preference() == DEFAULT_THEME
 
     def test_unknown_mapped_theme_warns_and_falls_through(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         from deepagents_cli.app import _load_theme_preference
 
@@ -592,7 +612,16 @@ class TestTerminalThemeMapping:
         monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
         monkeypatch.delenv(THEME, raising=False)
 
-        assert _load_theme_preference() == DEFAULT_THEME
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+
+        # The warning must surface both the bad theme name and the terminal so
+        # users have enough context to fix their config.
+        assert any(
+            "nonexistent-theme" in record.getMessage()
+            and "Apple_Terminal" in record.getMessage()
+            for record in caplog.records
+        )
 
     def test_missing_term_program_falls_through_to_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -621,6 +650,120 @@ class TestTerminalThemeMapping:
         monkeypatch.delenv(THEME, raising=False)
 
         assert _load_theme_preference() == DEFAULT_THEME
+
+    def test_non_string_mapped_value_warns_and_falls_through(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-string mapped value warns rather than silently falling through.
+
+        E.g., user thought they could list fallbacks — that's a TOML mistake
+        worth surfacing.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            "[ui.terminal_themes]\n"
+            '"Apple_Terminal" = ["langchain-light", "langchain"]\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.delenv(THEME, raising=False)
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+
+        assert any(
+            "Apple_Terminal" in record.getMessage() and "list" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_non_dict_terminal_themes_warns_and_falls_through(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A scalar `terminal_themes` value warns instead of silently no-oping.
+
+        Writing `terminal_themes = "..."` instead of `[ui.terminal_themes]`
+        is a structural mistake that should surface to the user.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui]\nterminal_themes = "langchain-light"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.delenv(THEME, raising=False)
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+
+        assert any(
+            "[ui.terminal_themes]" in record.getMessage() for record in caplog.records
+        )
+
+    def test_empty_term_program_falls_through_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty-string `TERM_PROGRAM` is treated as unset.
+
+        Some shells export `TERM_PROGRAM=""`; falling back to `dict.get("")`
+        would be surprising.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui.terminal_themes]\n"" = "langchain-light"\n'
+            '"Apple_Terminal" = "langchain"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "")
+        monkeypatch.delenv(THEME, raising=False)
+
+        assert _load_theme_preference() == DEFAULT_THEME
+
+    def test_terminal_mapping_is_case_sensitive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`TERM_PROGRAM` keys are matched verbatim, no case folding.
+
+        Config-file values are written by the user, so we don't second-guess
+        casing.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui.terminal_themes]\n"apple_terminal" = "langchain-light"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.delenv(THEME, raising=False)
+
+        assert _load_theme_preference() == DEFAULT_THEME
+
+    def test_terminal_mapping_migrates_legacy_textual_ansi(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legacy `textual-ansi` is migrated to `ansi-light` via the mapping.
+
+        Mirrors the migration in the saved-theme branch (pre-Textual 8.2.5).
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text('[ui.terminal_themes]\n"Apple_Terminal" = "textual-ansi"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.delenv(THEME, raising=False)
+
+        assert _load_theme_preference() == "ansi-light"
 
 
 class TestSaveThemePreference:
