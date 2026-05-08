@@ -524,8 +524,7 @@ class TestTerminalThemeMapping:
 
         config = tmp_path / "config.toml"
         config.write_text(
-            '[ui.terminal_themes]\n'
-            '"Apple_Terminal" = "langchain-light"\n'
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
@@ -541,7 +540,7 @@ class TestTerminalThemeMapping:
         config = tmp_path / "config.toml"
         config.write_text(
             '[ui]\ntheme = "langchain"\n'
-            '[ui.terminal_themes]\n'
+            "[ui.terminal_themes]\n"
             '"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
@@ -557,8 +556,7 @@ class TestTerminalThemeMapping:
 
         config = tmp_path / "config.toml"
         config.write_text(
-            '[ui.terminal_themes]\n'
-            '"Apple_Terminal" = "langchain-light"\n'
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
@@ -573,8 +571,7 @@ class TestTerminalThemeMapping:
 
         config = tmp_path / "config.toml"
         config.write_text(
-            '[ui.terminal_themes]\n'
-            '"Apple_Terminal" = "langchain-light"\n'
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         monkeypatch.setenv("TERM_PROGRAM", "SomeUnknownTerminal")
@@ -589,8 +586,7 @@ class TestTerminalThemeMapping:
 
         config = tmp_path / "config.toml"
         config.write_text(
-            '[ui.terminal_themes]\n'
-            '"Apple_Terminal" = "nonexistent-theme"\n'
+            '[ui.terminal_themes]\n"Apple_Terminal" = "nonexistent-theme"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
@@ -605,8 +601,7 @@ class TestTerminalThemeMapping:
 
         config = tmp_path / "config.toml"
         config.write_text(
-            '[ui.terminal_themes]\n'
-            '"Apple_Terminal" = "langchain-light"\n'
+            '[ui.terminal_themes]\n"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         monkeypatch.delenv("TERM_PROGRAM", raising=False)
