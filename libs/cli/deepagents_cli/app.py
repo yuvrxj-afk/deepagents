@@ -6236,7 +6236,7 @@ class DeepAgentsApp(App):
         (requires a terminal that supports FocusIn events). Re-focusing the chat
         input here keeps it ready for typing.
         """
-        if not self._chat_input:
+        if self._chat_input is None:
             return
         self._chat_input.set_cursor_blink(blink=True)
         if isinstance(self.screen, ModalScreen):
@@ -6248,8 +6248,9 @@ class DeepAgentsApp(App):
     def on_app_blur(self) -> None:
         """Pause the chat input cursor blink when the terminal loses OS focus.
 
-        `TextArea` pauses its own blink in `_watch_has_focus`, but `AppBlur`
-        does not change widget focus, so we toggle `cursor_blink` here.
+        `TextArea` pauses its own blink when its `has_focus` flips, but
+        `AppBlur` does not change widget focus, so we toggle `cursor_blink`
+        manually.
         """
         if self._chat_input is None:
             return
