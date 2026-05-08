@@ -214,11 +214,11 @@ def _load_theme_preference() -> str:
     Resolution order:
 
     1. `DEEPAGENTS_CLI_THEME` env var (explicit override).
-    2. `[ui].theme` in `~/.deepagents/config.toml` (saved preference). An
-        invalid value here returns the default — the user's explicit choice is
-        not silently overridden by the terminal mapping.
-    3. `[ui.terminal_themes]` mapping keyed by `TERM_PROGRAM` (smart default,
-        consulted only when no `[ui].theme` is set).
+    2. `[ui.terminal_themes]` mapping keyed by `TERM_PROGRAM` — wins over the
+        saved preference so a user moving between terminals (e.g. dark iTerm,
+        light Apple Terminal) gets the right theme automatically.
+    3. `[ui].theme` in `~/.deepagents/config.toml` (saved preference, used
+        when no terminal mapping matches).
     4. `theme.DEFAULT_THEME`.
 
     Returns:
@@ -261,17 +261,6 @@ def _load_theme_preference() -> str:
 
     ui = data.get("ui", {})
 
-    saved = ui.get("theme")
-    resolved = _resolve_config_theme(saved)
-    if resolved is not None:
-        return resolved
-    if isinstance(saved, str):
-        logger.warning(
-            "Unknown theme '%s' in config; falling back to default",
-            saved,
-        )
-        return theme.DEFAULT_THEME
-
     terminal_themes = ui.get("terminal_themes")
     if isinstance(terminal_themes, dict):
         term_program = os.environ.get("TERM_PROGRAM")
@@ -299,6 +288,16 @@ def _load_theme_preference() -> str:
             "[ui.terminal_themes] should be a table mapping TERM_PROGRAM "
             "values to theme names; got %s",
             type(terminal_themes).__name__,
+        )
+
+    saved = ui.get("theme")
+    resolved = _resolve_config_theme(saved)
+    if resolved is not None:
+        return resolved
+    if isinstance(saved, str):
+        logger.warning(
+            "Unknown theme '%s' in config; falling back to default",
+            saved,
         )
 
     return theme.DEFAULT_THEME

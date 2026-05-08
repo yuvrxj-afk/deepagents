@@ -532,9 +532,14 @@ class TestTerminalThemeMapping:
 
         assert _load_theme_preference() == "langchain-light"
 
-    def test_saved_theme_overrides_terminal_mapping(
+    def test_terminal_mapping_overrides_saved_theme(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Mapping wins over saved theme.
+
+        Users moving between terminals (e.g. dark iTerm vs light Apple
+        Terminal) get the right theme without re-picking each time.
+        """
         from deepagents_cli.app import _load_theme_preference
 
         config = tmp_path / "config.toml"
@@ -547,9 +552,31 @@ class TestTerminalThemeMapping:
         monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
         monkeypatch.delenv(THEME, raising=False)
 
+        assert _load_theme_preference() == "langchain-light"
+
+    def test_saved_theme_used_when_no_terminal_mapping_match(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mapping miss falls through to the saved preference, not default.
+
+        When the current terminal isn't in the mapping table, the user's
+        saved preference still applies.
+        """
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[ui]\ntheme = "langchain"\n'
+            "[ui.terminal_themes]\n"
+            '"Apple_Terminal" = "langchain-light"\n'
+        )
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "SomeOtherTerminal")
+        monkeypatch.delenv(THEME, raising=False)
+
         assert _load_theme_preference() == "langchain"
 
-    def test_unknown_saved_theme_returns_default_before_terminal_mapping(
+    def test_unknown_saved_theme_falls_through_to_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from deepagents_cli.app import _load_theme_preference
@@ -561,7 +588,7 @@ class TestTerminalThemeMapping:
             '"Apple_Terminal" = "langchain-light"\n'
         )
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
-        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        monkeypatch.setenv("TERM_PROGRAM", "SomeOtherTerminal")
         monkeypatch.delenv(THEME, raising=False)
 
         assert _load_theme_preference() == DEFAULT_THEME
