@@ -43,11 +43,10 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
     handled natively by the embedded `OptionList`; Tab / Shift+Tab are bound
     here to advance the option list cursor for consistency with other
     selector screens (where Tab cycles focus across multiple widgets).
-    `n` toggles between human-readable labels and canonical registry keys —
-    the registry key is what `[ui.terminal_themes]` and `[ui].theme` accept,
-    so users editing config by hand can copy the exact value. `t` saves the
-    highlighted theme as the per-terminal default and updates the `(default)`
-    badge in place without closing the picker, so the user can keep browsing.
+    `action_toggle_names` toggles between human-readable labels and canonical
+    registry keys, which are accepted by the theme config. The terminal-default
+    action saves the highlighted theme for the current terminal and updates
+    the `(default)` badge in place without closing the picker.
     """
 
     CSS = """
@@ -151,7 +150,7 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
                 f" {glyphs.bullet} Enter select"
                 f" {glyphs.bullet} Esc cancel"
             )
-            action_line = "N labels/keys  •  T set for this terminal"
+            action_line = f"N labels/keys  {glyphs.bullet}  T set for this terminal"
             yield Static(f"{nav_line}\n{action_line}", classes="theme-selector-help")
 
     def on_mount(self) -> None:
@@ -222,10 +221,10 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         Writes `[ui.terminal_themes][TERM_PROGRAM] = name` and updates the
         `(default)` badge in the option list without closing the picker, so
         the user can confirm the change and keep browsing. `[ui].theme` is
-        intentionally not touched — pressing `t` is "save for this terminal",
-        not "save as my global default". The two save paths share a
-        `threading.Lock` (`_CONFIG_WRITE_LOCK` in `app.py`) so a quick
-        `t`-then-`Enter` can't race two writers over the same `config.toml`.
+        intentionally not touched because this action saves only the current
+        terminal default. Config writes are serialized in `app.py`, so
+        overlapping global-theme and per-terminal-theme saves cannot clobber
+        each other's keys.
 
         No-ops with a warning toast if `TERM_PROGRAM` is unset, or silently
         if the option list has no highlighted entry / the highlighted id
@@ -256,29 +255,35 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
 
         async def _persist() -> None:
             try:
-                from deepagents_cli.app import save_terminal_theme_mapping
+                from deepagents_cli.app import _save_terminal_theme_mapping_result
 
-                ok = await asyncio.to_thread(
-                    save_terminal_theme_mapping, term_program, name
+                status = await asyncio.to_thread(
+                    _save_terminal_theme_mapping_result, term_program, name
                 )
-            except (OSError, ImportError) as exc:
+            except Exception as exc:
                 logger.exception("Failed to persist terminal theme mapping")
                 self.app.notify(
-                    f"Could not save terminal mapping ({type(exc).__name__}); "
-                    "see logs in ~/.deepagents/logs/.",
+                    f"Could not save terminal mapping ({type(exc).__name__}).",
                     severity="error",
                     markup=False,
                     timeout=6,
                 )
                 return
-            if not ok:
+            if not status.ok:
                 self.app.notify(
-                    "Could not save terminal mapping; see logs in ~/.deepagents/logs/.",
-                    severity="warning",
+                    status.message or "Could not save terminal mapping.",
+                    severity=status.severity,
                     markup=False,
                     timeout=6,
                 )
                 return
+            if status.message is not None:
+                self.app.notify(
+                    status.message,
+                    severity=status.severity,
+                    markup=False,
+                    timeout=6,
+                )
             # Update the badge in place if the screen is still mounted.
             # The user may have dismissed the picker (Esc/Enter) while the
             # write was in flight; `is_mounted` guards the widget tree.

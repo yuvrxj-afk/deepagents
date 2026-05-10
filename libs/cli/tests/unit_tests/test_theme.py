@@ -13,6 +13,8 @@ from deepagents_cli._env_vars import THEME
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from _typeshed import SupportsRead
+
 from deepagents_cli import theme
 from deepagents_cli.theme import (
     DARK_COLORS,
@@ -551,6 +553,26 @@ class TestLoadTerminalDefault:
             for record in caplog.records
         )
 
+    def test_warns_on_non_dict_ui(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from deepagents_cli.app import _load_terminal_default
+
+        config = tmp_path / "config.toml"
+        config.write_text('ui = "junk"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_terminal_default() is None
+        assert any(
+            "[ui]" in record.getMessage() and "table" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_warns_on_unknown_mapped_theme(
         self,
         tmp_path: Path,
@@ -701,6 +723,25 @@ class TestLoadThemePreference:
         config.write_text('[model]\nname = "gpt-4"\n')
         monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
         assert _load_theme_preference() == DEFAULT_THEME
+
+    def test_warns_on_non_dict_ui(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from deepagents_cli.app import _load_theme_preference
+
+        config = tmp_path / "config.toml"
+        config.write_text('ui = "junk"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert _load_theme_preference() == DEFAULT_THEME
+        assert any(
+            "[ui]" in record.getMessage() and "table" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestTerminalThemeMapping:
@@ -1646,6 +1687,80 @@ class TestSaveTerminalThemeMapping:
             for record in caplog.records
         )
 
+    def test_repairs_non_dict_ui(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A scalar top-level `ui` value is replaced with a fresh table."""
+        import tomllib
+
+        from deepagents_cli.app import save_terminal_theme_mapping
+
+        config = tmp_path / "config.toml"
+        config.write_text('ui = "junk"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        with caplog.at_level("WARNING", logger="deepagents_cli.app"):
+            assert save_terminal_theme_mapping("Apple_Terminal", "langchain") is True
+        data = tomllib.loads(config.read_text())
+        assert isinstance(data["ui"], dict)
+        assert data["ui"]["terminal_themes"]["Apple_Terminal"] == "langchain"
+        assert any(
+            "[ui]" in record.getMessage() and "replacing" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_concurrent_global_and_terminal_writes_preserve_both_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Overlapping config saves keep both read-modify-write mutations."""
+        import contextlib
+        import threading
+        import tomllib
+
+        from deepagents_cli.app import (
+            save_terminal_theme_mapping,
+            save_theme_preference,
+        )
+
+        config = tmp_path / "config.toml"
+        config.write_text('[model]\nname = "existing"\n')
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+
+        original_load = tomllib.load
+        barrier = threading.Barrier(2)
+
+        def slow_load(fp: SupportsRead[bytes]) -> dict[str, object]:
+            data = original_load(fp)
+            with contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait(timeout=0.2)
+            return data
+
+        monkeypatch.setattr(tomllib, "load", slow_load)
+
+        results: list[bool] = []
+
+        def save_global() -> None:
+            results.append(save_theme_preference("langchain-light"))
+
+        def save_terminal() -> None:
+            results.append(save_terminal_theme_mapping("Apple_Terminal", "langchain"))
+
+        threads = [
+            threading.Thread(target=save_global),
+            threading.Thread(target=save_terminal),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = tomllib.loads(config.read_text())
+        assert results == [True, True]
+        assert data["ui"]["theme"] == "langchain-light"
+        assert data["ui"]["terminal_themes"]["Apple_Terminal"] == "langchain"
+
     def test_rejects_unknown_theme(self) -> None:
         from deepagents_cli.app import save_terminal_theme_mapping
 
@@ -1833,6 +1948,7 @@ class TestThemeSelectorScreen:
         import tomllib
 
         from textual.app import App
+        from textual.widgets import OptionList
 
         from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
 
@@ -1874,6 +1990,7 @@ class TestThemeSelectorScreen:
         import tomllib
 
         from textual.app import App
+        from textual.widgets import OptionList
 
         from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
 
@@ -1889,11 +2006,11 @@ class TestThemeSelectorScreen:
             await pilot.pause()
 
             registry_keys = list(theme.get_registry())
-            lc_index = registry_keys.index("langchain")
-            target_index = lc_index + 1
-            target_key = registry_keys[target_index]
+            target_key = next(key for key in registry_keys if key != "langchain")
+            target_index = registry_keys.index(target_key)
 
-            await pilot.press("down")
+            option_list = screen.query_one("#theme-options", OptionList)
+            option_list.highlighted = target_index
             await pilot.pause()
             await pilot.press("t")
             await app.workers.wait_for_complete()
@@ -2011,6 +2128,7 @@ class TestThemeSelectorScreen:
         """
         from textual.app import App
 
+        from deepagents_cli.app import _ConfigWriteResult
         from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
@@ -2019,8 +2137,10 @@ class TestThemeSelectorScreen:
         # Force the writer to report failure without actually raising —
         # exercises the `if ok:` else-branch in `_persist`.
         monkeypatch.setattr(
-            "deepagents_cli.app.save_terminal_theme_mapping",
-            lambda *_args, **_kwargs: False,
+            "deepagents_cli.app._save_terminal_theme_mapping_result",
+            lambda *_args, **_kwargs: _ConfigWriteResult(
+                False, "Could not save terminal mapping.", "error"
+            ),
         )
 
         notifications: list[tuple[str, str]] = []
@@ -2044,7 +2164,7 @@ class TestThemeSelectorScreen:
             await pilot.pause()
 
         assert any(
-            sev == "warning" and "terminal mapping" in msg for sev, msg in notifications
+            sev == "error" and "terminal mapping" in msg for sev, msg in notifications
         )
 
     async def test_t_notifies_on_save_exception(
@@ -2067,7 +2187,9 @@ class TestThemeSelectorScreen:
             msg = "simulated"
             raise OSError(msg)
 
-        monkeypatch.setattr("deepagents_cli.app.save_terminal_theme_mapping", _boom)
+        monkeypatch.setattr(
+            "deepagents_cli.app._save_terminal_theme_mapping_result", _boom
+        )
 
         notifications: list[tuple[str, str]] = []
 
@@ -2090,6 +2212,48 @@ class TestThemeSelectorScreen:
             await pilot.pause()
 
         assert any(sev == "error" and "OSError" in msg for sev, msg in notifications)
+
+    async def test_t_write_skips_rerender_after_screen_unmount(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The background terminal save tolerates the picker unmounting mid-write."""
+        import asyncio
+        import threading
+
+        from textual.app import App
+
+        from deepagents_cli.app import _ConfigWriteResult
+        from deepagents_cli.widgets.theme_selector import ThemeSelectorScreen
+
+        config = tmp_path / "config.toml"
+        monkeypatch.setattr("deepagents_cli.model_config.DEFAULT_CONFIG_PATH", config)
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _slow_save(*_args: object, **_kwargs: object) -> _ConfigWriteResult:
+            started.set()
+            release.wait(timeout=1)
+            return _ConfigWriteResult(True)
+
+        monkeypatch.setattr(
+            "deepagents_cli.app._save_terminal_theme_mapping_result", _slow_save
+        )
+
+        app = App()
+        async with app.run_test() as pilot:
+            _register_lc_theme(app)
+            screen = ThemeSelectorScreen(current_theme="langchain")
+            app.push_screen(screen)
+            await pilot.pause()
+
+            await pilot.press("t")
+            assert await asyncio.to_thread(started.wait, 1)
+            screen._is_mounted = False  # simulate mid-write teardown
+            release.set()
+            await app.workers.wait_for_complete()
+            screen._is_mounted = True  # keep Textual teardown normal
 
     async def test_terminal_default_badge_renders(self) -> None:
         """The `terminal_default` row renders with a `(default)` suffix."""
