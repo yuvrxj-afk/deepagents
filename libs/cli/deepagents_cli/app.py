@@ -863,6 +863,15 @@ _COMMAND_URLS: dict[str, str] = {
 }
 """Slash-command to URL mapping for commands that just open a browser."""
 
+_SANDBOX_DISPLAY_NAMES: dict[str, str] = {
+    "agentcore": "AgentCore",
+    "daytona": "Daytona",
+    "langsmith": "LangSmith",
+    "modal": "Modal",
+    "runloop": "Runloop",
+}
+"""Human-readable display names for sandbox providers."""
+
 
 _toast_internals_warned: list[bool] = [False]
 """Single-slot flag; once `_Toast._notification` is missing, log warning once.
@@ -1277,6 +1286,12 @@ class DeepAgentsApp(App):
 
         self._sandbox_type: str | None = raw if raw and raw != "none" else None
         """Normalized sandbox type (or `None`), attached to trace metadata."""
+
+        if sub_title is None and self._sandbox_type is not None:
+            display = _SANDBOX_DISPLAY_NAMES.get(
+                self._sandbox_type, self._sandbox_type.title()
+            )
+            self.sub_title = f"Sandbox: {display}"
 
         # Per-turn model overrides
         self._model_override: str | None = None
