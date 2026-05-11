@@ -7717,6 +7717,43 @@ class TestHeaderAndTitle:
             assert not app.query(Header)
 
 
+class TestSandboxSubTitle:
+    """sub_title reflects the active sandbox provider."""
+
+    async def test_sandbox_sets_sub_title(self) -> None:
+        """When a sandbox is active, sub_title shows the provider name."""
+        app = DeepAgentsApp(server_kwargs={"sandbox_type": "daytona"})
+        assert app.sub_title == "Sandbox: Daytona"
+
+    async def test_sandbox_sub_title_proper_casing(self) -> None:
+        """Provider display names use proper casing."""
+        app = DeepAgentsApp(server_kwargs={"sandbox_type": "langsmith"})
+        assert app.sub_title == "Sandbox: LangSmith"
+
+        app2 = DeepAgentsApp(server_kwargs={"sandbox_type": "agentcore"})
+        assert app2.sub_title == "Sandbox: AgentCore"
+
+    async def test_explicit_sub_title_overrides_sandbox(self) -> None:
+        """An explicitly passed sub_title is not overwritten by sandbox info."""
+        app = DeepAgentsApp(sub_title="custom", server_kwargs={"sandbox_type": "modal"})
+        assert app.sub_title == "custom"
+
+    async def test_no_sandbox_leaves_sub_title_default(self) -> None:
+        """Without a sandbox, sub_title remains at its Textual default."""
+        app = DeepAgentsApp()
+        assert app.sub_title == ""
+
+    async def test_sandbox_none_does_not_set_sub_title(self) -> None:
+        """The argparse default `'none'` is treated as no sandbox."""
+        app = DeepAgentsApp(server_kwargs={"sandbox_type": "none"})
+        assert app.sub_title == ""
+
+    async def test_unknown_provider_uses_title_case_fallback(self) -> None:
+        """An unrecognized provider falls back to `.title()` casing."""
+        app = DeepAgentsApp(server_kwargs={"sandbox_type": "kubernetes"})
+        assert app.sub_title == "Sandbox: Kubernetes"
+
+
 class TestHandleExternalSignal:
     """Verify routing of `kind=signal` external events."""
 
