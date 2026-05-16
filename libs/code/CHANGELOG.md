@@ -1,5 +1,19 @@
 # Deep Agents Code Changelog
 
+## [0.1.0](https://github.com/yuvrxj-afk/deepagents/compare/deepagents-code==0.1.1...deepagents-code==0.1.0) (2026-05-16)
+
+
+### Features
+
+* **code:** port from `libs/cli` ([#3388](https://github.com/yuvrxj-afk/deepagents/issues/3388)) ([2ac7d41](https://github.com/yuvrxj-afk/deepagents/commit/2ac7d4153398889100d5fd163ab4a122633862b5))
+* **sdk:** v0.6 ([4db09ac](https://github.com/yuvrxj-afk/deepagents/commit/4db09acba34b38521192b8f278723524be560779))
+
+
+### Bug Fixes
+
+* **code:** correct LangSmith sandbox working directory ([#3415](https://github.com/yuvrxj-afk/deepagents/issues/3415)) ([b0e8d83](https://github.com/yuvrxj-afk/deepagents/commit/b0e8d83f97a2a698268173a839000c84e8368324))
+* **code:** guard `fetch_url` against SSRF ([#3411](https://github.com/yuvrxj-afk/deepagents/issues/3411)) ([54d8521](https://github.com/yuvrxj-afk/deepagents/commit/54d8521976940dfe147ead4b56565360241335be))
+
 ## [0.1.1](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.0...deepagents-code==0.1.1) (2026-05-16)
 
 ### Bug Fixes
